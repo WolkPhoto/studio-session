@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.25.0 (folder `DigiFour_1_25`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.26.0 (folder `DigiFour_1_26`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -345,3 +345,30 @@ the lineup and build commands. 1.0 compiled clean on the first try (Nov 2, 7:28)
 - GitHub: publish_github.command (gh install/sign-in, creates repo; private code gets a public
   <name>-releases repo for DMGs; permanent clone ~/Developer/StudioSession; later runs rsync + commit +
   push). release.command offers `gh release create v<version>` with RELEASE_NOTES.md.
+
+### 1.25 test results (Nov 5, T7 WolkPhoto2TB APFS, 10 Gb/s, Capture One closed)
+- Full verify, 256.22 GB / 36,700 files, new folder: 15:32 (avg ~293 MB/s counted as written bytes;
+  ~350-400 MB/s most of the way, dropped to ~100 MB/s for the last ~15%). Nov 1 without checksums: 6:30.
+  A same-day run with checksums off has not been done yet, so the split between read-back cost and
+  drive state is unknown.
+- Report for that run was 4 MB / 36,725 lines (every file listed) -> shortened in 1.26.
+
+### 1.26
+- Read-back overlaps copying: large files are copied with copyLarge(verify:, readBack: false), then a
+  separate task (startCheck, LaneResult.checked) reads the temp file back while the next large file
+  copies. At most one read-back at a time; copies run at most two files ahead (waitingChecks). A
+  mismatch removes the temp and re-admits the file once (Staged.attempt), then ChecksumMismatch.
+  Small files still verify inline after copyfile. Speed effect not measured yet.
+- Checksum modes (DigiSuite.verifyMode: full / quick / off; 1.25's DigiSuite.verifyCopies=false maps to
+  off): Quick = sync(verify: true, readBack: false), originals hashed while copying, no read-back;
+  SyncProgress.readBackOn; report says Quick. A "Checksums: …" menu replaces "Digi Stream · Size + date"
+  on the backup control bar; segmented picker + explanation in the options.
+- Report: per-folder totals (DigiBackupReport.group = first two path levels, up to 80 groups), no
+  per-file list (that's Checksums.xxh64), file name stamp now yyyy-MM-dd HHmmss.
+- Sidebar backup panel: time left under the bar and per drive ("Copying 65% · about 3 min left",
+  DigiBackupSnapshot.etaText / eta); next-step Pause icon is pause.fill (was the sync arrows).
+- Check: waiting message "Waiting for the backup to finish, then checking automatically" and it runs
+  when autoRefreshAllowed turns true (Quick/Standard; Deep Verify still needs a click).
+- Eject of a drive that's already gone: "<name> is already unplugged. Nothing to eject."
+- Connected-drive folder suggestions use the backup source's name (syncSource ?? root), not the
+  Home session (Jeff saw "testing" while backing up 2026_10_14_LIG_GO); refreshed when the source changes.

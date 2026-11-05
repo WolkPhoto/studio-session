@@ -169,7 +169,15 @@ struct GripShell<Content: View>: View {
                         .foregroundStyle(t.accent)
                 }
             }
-            if snapshot.running { DigiProgressBar(fraction: snapshot.fraction, height: 6) }
+            if snapshot.running {
+                DigiProgressBar(fraction: snapshot.fraction, height: 6)
+                let left = DigiBackupSnapshot.etaText(snapshot.eta)
+                if !left.isEmpty {
+                    Text(left.prefix(1).uppercased() + left.dropFirst())
+                        .font(DigiBrand.body(11, .semibold))
+                        .foregroundStyle(t.subtext)
+                }
+            }
             if snapshot.drives.isEmpty {
                 Text("No drives chosen yet.")
                     .font(DigiBrand.body(12))

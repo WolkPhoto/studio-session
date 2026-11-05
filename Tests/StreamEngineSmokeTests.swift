@@ -215,6 +215,18 @@ enum StreamEngineSmokeTests {
         try check(verifiedAgain.reportPath.isEmpty, "An incremental with nothing new wrote another report")
         let backupScan = try DigiFastBackupEngine.snapshot(verifyTarget, filter: BackupFilter())
         try check(!backupScan.files.contains { $0.relative.hasPrefix(DigiFastBackupEngine.reportsName) }, "Report folder was treated as shoot files")
+        // v1.26: Quick mode checksums originals without reading copies back.
+        let quickTarget = fixture.appendingPathComponent("QuickTarget", isDirectory: true)
+        try fm.createDirectory(at: quickTarget, withIntermediateDirectories: false)
+        let quick = await DigiStreamEngine.sync(source: source, destination: quickTarget, archiveChanged: true, archiveRemoved: true,
+            filter: BackupFilter(), control: BackupControl(), verify: true, readBack: false, report: { _ in })
+        try check(quick.errorCount == 0 && quick.verifiedFiles == quick.completedFiles, "Quick backup failed: " + quick.status)
+        let quickList = DigiBackupReport.readChecksums(quickTarget.appendingPathComponent(DigiFastBackupEngine.reportsName)
+            .appendingPathComponent(DigiBackupReport.checksumFileName))
+        try check(quickList == list, "Quick and full checksums differ")
+        let quickReport = try String(contentsOfFile: quick.reportPath, encoding: .utf8)
+        try check(quickReport.contains("Quick"), "Quick report doesn't say Quick")
+        try check(DigiBackupReport.group(for: "Capture/LG/Scene/a.ARW") == "Capture/LG", "Report folder grouping is wrong")
         print("PASS (v1.25): xxHash64 test values, verified copies, checksum list and report")
 
         // 9. v1.25: archive trim and clear touch only the archive folders, oldest first.

@@ -314,7 +314,7 @@ struct FolderCompareView: View {
                             if roots.count < 2 {
                                 progress = "Add at least two folders to compare."
                             } else if !autoRefreshAllowed {
-                                progress = "A backup is running. Click Refresh to compare now, or wait until it finishes."
+                                progress = "Waiting for the backup to finish, then checking automatically. Click Refresh to check now."
                             } else {
                                 compare()
                             }
@@ -439,6 +439,10 @@ struct FolderCompareView: View {
         }
         .onChange(of: isActive) { _, active in
             if active { reconcileLinkedFolders(); rebuildVisibleRows(); autoRefresh() }
+        }
+        // v1.26: a check that waited for a backup starts when the backup finishes.
+        .onChange(of: autoRefreshAllowed) { _, allowed in
+            if allowed { autoRefresh() }
         }
         .onChange(of: differencesOnly) { _ in rebuildVisibleRows() }
         .onChange(of: sessionRoot) { _ in reconcileLinkedFolders() }
@@ -783,7 +787,7 @@ struct FolderCompareView: View {
     private func autoRefresh() {
         guard isActive, !running, roots.count >= 2 else { return }
         if !autoRefreshAllowed {
-            progress = "A backup is running. Click Refresh to compare now, or wait until it finishes."
+            progress = "Waiting for the backup to finish, then checking automatically. Click Refresh to check now."
             return
         }
         if mode == .deep {

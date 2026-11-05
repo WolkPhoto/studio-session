@@ -16,6 +16,8 @@ struct DigiDriveLine: Identifiable {
     let mbps: Double
     let state: DigiDriveState
     let lastBackup: Date?
+    /// v1.26: seconds left on this drive while it copies.
+    var eta: Double? = nil
 }
 
 struct DigiBackupSnapshot {
@@ -25,6 +27,17 @@ struct DigiBackupSnapshot {
     let mbps: Double
     let drives: [DigiDriveLine]
     let lastBackup: Date?
+    /// v1.26: time until the slowest copying drive finishes.
+    var eta: Double? = nil
+
+    /// "about 3 min left", "under a minute left", or "" when unknown.
+    static func etaText(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite, seconds > 0 else { return "" }
+        if seconds < 60 { return "under a minute left" }
+        let minutes = Int((seconds / 60).rounded())
+        if minutes < 60 { return "about \(minutes) min left" }
+        return String(format: "about %dh %02dm left", minutes / 60, minutes % 60)
+    }
 
     var connectedCount: Int { drives.filter { $0.state != .disconnected }.count }
     var doneCount: Int { drives.filter { $0.state == .done }.count }
@@ -36,6 +49,7 @@ struct DigiBackupSnapshot {
         var done: Int64 = 0
         var speed: Double = 0
         var newest: Date? = nil
+        var longest: Double? = nil
         for destination in model.backups {
             let path = destination.path
             let progress = model.syncProgress.first { $0.destination == path }
@@ -48,6 +62,7 @@ struct DigiBackupSnapshot {
             var status = available ? "Ready" : "Not connected"
             var fraction: Double = 0
             var mbps: Double = 0
+            var driveETA: Double? = nil
             if let progress {
                 status = progress.status
                 let isComplete = progress.status == DigiFastBackupEngine.completeStatus
@@ -74,6 +89,10 @@ struct DigiBackupSnapshot {
                     state = .copying
                     mbps = progress.liveMBps
                 }
+                if state == .copying, let left = progress.eta {
+                    driveETA = left
+                    longest = max(longest ?? 0, left)
+                }
                 total += progress.totalBytes
                 done += min(progress.completedBytes, progress.totalBytes)
                 speed += mbps
@@ -83,12 +102,12 @@ struct DigiBackupSnapshot {
                 status = "Not connected"
             }
             lines.append(DigiDriveLine(id: path, name: destination.lastPathComponent, fraction: fraction,
-                                       status: status, mbps: mbps, state: state, lastBackup: last))
+                                       status: status, mbps: mbps, state: state, lastBackup: last, eta: driveETA))
         }
         var overall: Double = 0
         if total > 0 { overall = Double(done) / Double(total) }
         return DigiBackupSnapshot(running: model.syncBusy, paused: model.everythingPaused,
-                                  fraction: overall, mbps: speed, drives: lines, lastBackup: newest)
+                                  fraction: overall, mbps: speed, drives: lines, lastBackup: newest, eta: longest)
     }
 }
 
@@ -125,9 +144,11 @@ struct DigiNextStep {
                     detail: "Nothing is lost. Resume when you're ready.", button: "Resume", icon: "pause.circle")
             }
             let speed = Int(snapshot.mbps.rounded())
-            let detail = speed > 0 ? "Copying \(root.lastPathComponent) at \(speed) MB/s." : "Copying \(root.lastPathComponent)."
+            var detail = speed > 0 ? "Copying \(root.lastPathComponent) at \(speed) MB/s." : "Copying \(root.lastPathComponent)."
+            let left = DigiBackupSnapshot.etaText(snapshot.eta)
+            if !left.isEmpty { detail += " " + left.prefix(1).uppercased() + left.dropFirst() + "." }
             return DigiNextStep(kind: .backingUp, title: "Backing up: \(percent)%",
-                detail: detail, button: "Pause", icon: "arrow.triangle.2.circlepath")
+                detail: detail, button: "Pause", icon: "pause.fill")
         }
         if model.backups.isEmpty {
             return DigiNextStep(kind: .chooseDrive, title: "Choose a backup drive",
@@ -223,7 +244,10 @@ func digiStateIcon(_ state: DigiDriveState) -> String {
 
 func digiStateWord(_ line: DigiDriveLine) -> String {
     switch line.state {
-    case .copying: return "Copying \(Int((line.fraction * 100).rounded()))%"
+    case .copying:
+        let left = DigiBackupSnapshot.etaText(line.eta)
+        let percent = "Copying \(Int((line.fraction * 100).rounded()))%"
+        return left.isEmpty ? percent : percent + " · " + left
     case .paused: return "Paused"
     case .queued: return "Waiting its turn"
     case .done: return "Up to date"

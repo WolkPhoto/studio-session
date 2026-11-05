@@ -31,6 +31,8 @@ struct SyncProgress: Identifiable, Sendable {
     var engineNote: String = ""
     // v1.25: checksums. Files copied and verified this run, and where the report went.
     var verifyOn = false
+    /// v1.26: false in Quick mode (originals checksummed, copies not read back).
+    var readBackOn = false
     var verifiedFiles = 0
     var reportPath = ""
     // v1.25: what the automatic archive clean-up did on this drive, if anything.

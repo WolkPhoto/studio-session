@@ -47,6 +47,9 @@ enum DigiStreamEngine {
         let seconds: Double
         /// v1.25: xxHash64 of the source, already compared with the copy read back.
         var checksum: UInt64? = nil
+        /// v1.26: large files are read back in their own step while the next file copies.
+        var needsReadBack = false
+        var attempt = 0
     }
 
     /// v1.25: the copy read back from the drive didn't match the source.
@@ -59,6 +62,8 @@ enum DigiStreamEngine {
 
     enum LaneResult: Sendable {
         case staged(Staged)
+        /// v1.26: a large file's read-back finished; true when it matched.
+        case checked(Staged, Bool)
         case tick
     }
 
@@ -126,7 +131,8 @@ enum DigiStreamEngine {
     /// Checks Pause and Stop between chunks.
     @discardableResult
     static func copyLarge(source: URL, target: URL, expectedSize: Int64,
-                          control: BackupControl, written: ByteCounter, verify: Bool = false) throws -> UInt64? {
+                          control: BackupControl, written: ByteCounter, verify: Bool = false,
+                          readBack: Bool = true) throws -> UInt64? {
         let input = open(source.path, O_RDONLY)
         guard input >= 0 else { throw posixFailure("Could not open", source.path) }
         defer { close(input) }
@@ -178,6 +184,7 @@ enum DigiStreamEngine {
         try copyMetadata(source: source, target: target)
         guard verify else { return nil }
         let expected = hasher.finish()
+        guard readBack else { return expected }
         // Read the new copy back from the drive and compare.
         let copied = try DigiChecksum.hashFile(target, uncached: true, control: control)
         guard copied == expected else { throw ChecksumMismatch(relative: source.lastPathComponent) }
@@ -186,7 +193,8 @@ enum DigiStreamEngine {
 
     /// Small-file copy through macOS copyfile (contents and all file information).
     @discardableResult
-    static func copySmall(source: URL, target: URL, verify: Bool = false, control: BackupControl? = nil) throws -> UInt64? {
+    static func copySmall(source: URL, target: URL, verify: Bool = false, readBack: Bool = true,
+                          control: BackupControl? = nil) throws -> UInt64? {
         #if canImport(Darwin)
         let flags = copyfile_flags_t(COPYFILE_ACL | COPYFILE_STAT | COPYFILE_XATTR | COPYFILE_DATA | COPYFILE_EXCL)
         if copyfile(source.path, target.path, nil, flags) != 0 {
@@ -197,6 +205,7 @@ enum DigiStreamEngine {
         #endif
         guard verify else { return nil }
         let expected = try DigiChecksum.hashFile(source, uncached: false, control: control)
+        guard readBack else { return expected }
         let copied = try DigiChecksum.hashFile(target, uncached: true, control: control)
         guard copied == expected else { throw ChecksumMismatch(relative: source.lastPathComponent) }
         return expected
@@ -252,6 +261,7 @@ enum DigiStreamEngine {
                      filter: BackupFilter, snapshot supplied: DigiSyncSourceSnapshot? = nil,
                      control: BackupControl,
                      verify: Bool = false,
+                     readBack: Bool = true,
                      gate: DigiCaptureGate? = nil,
                      availableSpace: @escaping @Sendable (URL) -> Int64? = { DigiFastBackupEngine.availableBytes($0) },
                      report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
@@ -259,6 +269,9 @@ enum DigiStreamEngine {
         let started = Date()
         var state = SyncProgress(destination: destination.path, status: "Checking new and changed files…")
         state.verifyOn = verify
+        state.readBackOn = verify && readBack
+        // v1.26: large files are read back in a separate step, overlapping the next copy.
+        let pipelineReadBack: Bool = verify && readBack
         // v1.25: checksums of files verified this run, for the report.
         var verified: [(String, UInt64)] = []
         var removedThisRun: [String] = []
@@ -470,7 +483,7 @@ enum DigiStreamEngine {
                     var largeActive = 0, smallActive = 0
                     var tickActive = false
 
-                    func admit(_ entry: BackupEntry, lane: Lane) {
+                    func admit(_ entry: BackupEntry, lane: Lane, attempt: Int = 0) {
                         let temporary = entry.destination.deletingLastPathComponent()
                             .appendingPathComponent(".shootwrap-" + UUID().uuidString + ".tmp")
                         temporaries.insert(temporary)
@@ -491,10 +504,13 @@ enum DigiStreamEngine {
                                 try waitIfPaused(laneControl)
                                 func copyOnce() throws -> UInt64? {
                                     if lane == .large {
+                                        // With read-back on, large files are checked in their own step (below).
                                         return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
-                                                             control: laneControl, written: counter, verify: verify)
+                                                             control: laneControl, written: counter, verify: verify,
+                                                             readBack: false)
                                     }
-                                    let value = try copySmall(source: entry.source, target: temporary, verify: verify, control: laneControl)
+                                    let value = try copySmall(source: entry.source, target: temporary, verify: verify,
+                                                              readBack: readBack, control: laneControl)
                                     counter.add(entry.size)
                                     return value
                                 }
@@ -516,7 +532,31 @@ enum DigiStreamEngine {
                                 }
                             }
                             let seconds = Date().timeIntervalSince(copyBegan)
-                            return .staged(Staged(entry: entry, temporary: temporary, lane: lane, seconds: seconds, checksum: checksum))
+                            var staged = Staged(entry: entry, temporary: temporary, lane: lane, seconds: seconds, checksum: checksum)
+                            staged.needsReadBack = lane == .large && pipelineReadBack
+                            staged.attempt = attempt
+                            return .staged(staged)
+                        }
+                    }
+
+                    /// v1.26: reads a finished large copy back from the drive while the
+                    /// next large file is already copying.
+                    var checkActive = 0
+                    var waitingChecks: [Staged] = []
+                    func startCheck(_ staged: Staged) {
+                        checkActive += 1
+                        let laneControl = abort
+                        let laneGate = gate
+                        group.addTask(priority: .userInitiated) {
+                            let matched: Bool = try await runBlocking { () throws -> Bool in
+                                func readOnce() throws -> Bool {
+                                    let copied = try DigiChecksum.hashFile(staged.temporary, uncached: true, control: laneControl)
+                                    return copied == staged.checksum
+                                }
+                                if let laneGate { return try laneGate.withPolicy { try readOnce() } }
+                                return try readOnce()
+                            }
+                            return .checked(staged, matched)
                         }
                     }
 
@@ -531,15 +571,19 @@ enum DigiStreamEngine {
                     do {
                         while true {
                             try await pauseIfNeeded()
-                            while largeActive < 1 && nextLarge < large.count {
+                            // Copies run at most two files ahead of the read-backs.
+                            while largeActive < 1 && nextLarge < large.count && waitingChecks.count < 2 {
                                 admit(large[nextLarge], lane: .large)
                                 nextLarge += 1; largeActive += 1
+                            }
+                            if checkActive == 0, !waitingChecks.isEmpty {
+                                startCheck(waitingChecks.removeFirst())
                             }
                             while smallActive < smallLaneWidth && nextSmall < small.count {
                                 admit(small[nextSmall], lane: .small)
                                 nextSmall += 1; smallActive += 1
                             }
-                            if largeActive + smallActive == 0 { break }
+                            if largeActive + smallActive + checkActive == 0 && waitingChecks.isEmpty { break }
                             if !tickActive { addTick() }
                             await publish()
                             let waitStarted = Date()
@@ -552,10 +596,31 @@ enum DigiStreamEngine {
                                 tickActive = false
                             case .staged(let staged):
                                 if staged.lane == .large { largeActive -= 1 } else { smallActive -= 1 }
+                                if staged.needsReadBack {
+                                    // Read back later; the next large copy can start now.
+                                    if checkActive == 0 { startCheck(staged) } else { waitingChecks.append(staged) }
+                                    continue
+                                }
                                 // Never commit a finished copy after Stop.
                                 try await pauseIfNeeded()
                                 try commit(staged)
                                 await publish()
+                            case .checked(let staged, let matched):
+                                checkActive -= 1
+                                if matched {
+                                    try await pauseIfNeeded()
+                                    try commit(staged)
+                                    await publish()
+                                } else if staged.attempt == 0 {
+                                    // One fresh copy before it counts as a failure.
+                                    try? fm.removeItem(at: staged.temporary)
+                                    temporaries.remove(staged.temporary)
+                                    inFlight.add(-staged.entry.size)
+                                    admit(staged.entry, lane: .large, attempt: 1)
+                                    largeActive += 1
+                                } else {
+                                    throw ChecksumMismatch(relative: staged.entry.relative)
+                                }
                             }
                         }
                     } catch {
@@ -610,7 +675,7 @@ enum DigiStreamEngine {
                 source: source, destination: root, device: device, started: started, finished: Date(),
                 status: state.status, verified: verified, removed: removedThisRun,
                 unchangedFiles: state.unchangedFiles, sourceKeys: reportKeys,
-                copiedBytes: committedBytes)
+                copiedBytes: committedBytes, readBack: readBack)
             do {
                 state.reportPath = try DigiBackupReport.write(input)
             } catch {

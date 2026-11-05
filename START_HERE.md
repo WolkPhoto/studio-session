@@ -19,16 +19,16 @@ from the Help menu. Each app has its own settings, so they can all be installed 
 Unzip into Downloads, then in Terminal:
 
 ```bash
-cd "$HOME/Downloads/DigiFour_1_25" && bash build_all.command
+cd "$HOME/Downloads/DigiFour_1_26" && bash build_all.command
 ```
 
 That runs the backup tests once, builds all four, and opens them. To build one:
 
 ```bash
-cd "$HOME/Downloads/DigiFour_1_25" && bash build_grip.command
-cd "$HOME/Downloads/DigiFour_1_25" && bash build_wrap.command
-cd "$HOME/Downloads/DigiFour_1_25" && bash build_proof.command
-cd "$HOME/Downloads/DigiFour_1_25" && bash build_tally.command
+cd "$HOME/Downloads/DigiFour_1_26" && bash build_grip.command
+cd "$HOME/Downloads/DigiFour_1_26" && bash build_wrap.command
+cd "$HOME/Downloads/DigiFour_1_26" && bash build_proof.command
+cd "$HOME/Downloads/DigiFour_1_26" && bash build_tally.command
 ```
 
 The classic Digi Suite still builds from the same folder: `bash build.command`.

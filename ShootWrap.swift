@@ -404,6 +404,9 @@ struct ShootWrapProject: Codable {
                 self.ejectingVolumes.remove(volume)
                 if outcome.success {
                     self.syncMessage = name + " ejected. It is safe to unplug."
+                } else if !FileManager.default.fileExists(atPath: volume) {
+                    // v1.26: it was already unplugged or ejected.
+                    self.syncMessage = name + " is already unplugged. Nothing to eject."
                 } else {
                     self.syncMessage = "Could not eject " + name + ". " + outcome.message
                 }
@@ -684,8 +687,24 @@ struct ShootWrapProject: Codable {
             }
         }
     }
-    @Published var verifyCopies: Bool = UserDefaults.standard.object(forKey: "DigiSuite.verifyCopies") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(verifyCopies, forKey: Self.verifyCopiesKey) }
+    /// v1.26: "full" (read every copy back), "quick" (checksum originals only) or "off".
+    nonisolated static let verifyModeKey = "DigiSuite.verifyMode"
+    nonisolated static func storedVerifyMode() -> String {
+        let defaults = UserDefaults.standard
+        if let mode = defaults.string(forKey: verifyModeKey), ["full", "quick", "off"].contains(mode) { return mode }
+        // 1.25 had a single on/off switch.
+        if let old = defaults.object(forKey: verifyCopiesKey) as? Bool, old == false { return "off" }
+        return "full"
+    }
+    @Published var verifyMode: String = WrapModel.storedVerifyMode() {
+        didSet { UserDefaults.standard.set(verifyMode, forKey: Self.verifyModeKey) }
+    }
+    var verifyModeTitle: String {
+        switch verifyMode {
+        case "quick": return "Checksums: Quick"
+        case "off": return "Checksums: Off"
+        default: return "Checksums: Full verify"
+        }
     }
     @Published var gentleWhileCapture: Bool = UserDefaults.standard.object(forKey: "DigiSuite.gentleWhileCapture") as? Bool ?? true {
         didSet { UserDefaults.standard.set(gentleWhileCapture, forKey: Self.gentleKey) }
@@ -766,8 +785,12 @@ struct ShootWrapProject: Codable {
     @Published var discoveredBackupScanning = false
     @Published var discoveredBackupDrives: [DiscoveredBackupDrive] = []
 
+    /// v1.26: backup folders are named after what's being backed up (the backup
+    /// source), which can differ from the session open on Home.
+    var backupSourceForNaming: URL? { syncSource ?? root }
+
     func discoverExternalBackupFolders() {
-        guard let session = root else {
+        guard let session = backupSourceForNaming else {
             discoveredBackupMessage = "Open a session before discovering drives."
             return
         }
@@ -810,7 +833,7 @@ struct ShootWrapProject: Codable {
                 results.append(DiscoveredBackupDrive(volume: volume, matchingFolder: match, suggestedFolder: direct))
             }
             DispatchQueue.main.async {
-                guard self.root?.resolvingSymlinksInPath().standardizedFileURL.path == sessionPath else {
+                guard self.backupSourceForNaming?.resolvingSymlinksInPath().standardizedFileURL.path == sessionPath else {
                     self.discoveredBackupScanning = false
                     return
                 }
@@ -849,7 +872,7 @@ struct ShootWrapProject: Codable {
     }
 
     func createDiscoveredBackupFolder(on volume: URL) {
-        guard let session = root else { return }
+        guard let session = backupSourceForNaming else { return }
         let target = volume.appendingPathComponent(session.lastPathComponent, isDirectory: true)
         let alert = NSAlert()
         alert.messageText = "Create backup folder?"
@@ -891,7 +914,11 @@ struct ShootWrapProject: Codable {
     }
     func chooseSyncSource() {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
-        if panel.runModal() == .OK, let url = panel.url { syncSource = url; syncProgress = []; syncPreviewReady = false }
+        if panel.runModal() == .OK, let url = panel.url {
+            syncSource = url; syncProgress = []; syncPreviewReady = false
+            // v1.26: folder suggestions on connected drives follow the new source's name.
+            discoverExternalBackupFolders()
+        }
     }
     nonisolated static func syncInventory(_ root: URL, filter: BackupFilter = BackupFilter()) throws -> [(String, URL, Int64)] {
         let fm = FileManager.default
@@ -933,7 +960,9 @@ struct ShootWrapProject: Codable {
         }
         // v1.25: checksums on by default; backups step aside while Capture One is open.
         let defaults = UserDefaults.standard
-        let verify: Bool = defaults.object(forKey: WrapModel.verifyCopiesKey) as? Bool ?? true
+        let mode: String = WrapModel.storedVerifyMode()
+        let verify: Bool = mode != "off"
+        let readBack: Bool = mode == "full"
         let gentle: Bool = defaults.object(forKey: WrapModel.gentleKey) as? Bool ?? true
         let gate: DigiCaptureGate? = gentle ? DigiCaptureGate(probe: { CaptureOneTarget.running() != nil }) : nil
         // v1.25: optional clean-up of the oldest archived copies when the drive runs low,
@@ -951,7 +980,7 @@ struct ShootWrapProject: Codable {
         trim()
         var result = await DigiStreamEngine.sync(source: source, destination: destination, archiveChanged: archiveChanged,
             archiveRemoved: archiveRemoved, filter: filter, snapshot: snapshot, control: control,
-            verify: verify, gate: gate, report: report)
+            verify: verify, readBack: readBack, gate: gate, report: report)
         trim()
         if trimmedRuns > 0 {
             let freed = ByteCountFormatter.string(fromByteCount: trimmedBytes, countStyle: .file)
@@ -2831,6 +2860,52 @@ struct ShootWrapView: View {
         }
     }
 
+    /// v1.26: the checksum setting, always visible on the backup screen.
+    private var verifyModeMenu: some View {
+        Menu {
+            Picker("Checksums", selection: $model.verifyMode) {
+                Text("Full verify: read every copy back (safest)").tag("full")
+                Text("Quick: checksum originals, don't read copies back").tag("quick")
+                Text("Off: size and date only").tag("off")
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Label(model.verifyModeTitle, systemImage: model.verifyMode == "off" ? "seal" : "checkmark.seal")
+                .font(.caption)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(model.syncBusy)
+        .help("How each copy is checked. Change it before a backup starts.")
+    }
+
+    private var verifyModePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("Checksums", selection: $model.verifyMode) {
+                Text("Full verify").tag("full")
+                Text("Quick").tag("quick")
+                Text("Off").tag("off")
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .disabled(model.syncBusy)
+            Text(verifyModeExplanation)
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var verifyModeExplanation: String {
+        switch model.verifyMode {
+        case "quick":
+            return "Each original gets an xxHash64 checksum while it copies, about as fast as no checksums. Copies aren't read back, so a bad write wouldn't be caught. Report and checksum list go in " + DigiFastBackupEngine.reportsName + " on each drive."
+        case "off":
+            return "Files are matched by size and date only. No report or checksum list. Use Check > Deep Verify for a content check."
+        default:
+            return "Each copy is read back from the drive and its xxHash64 checksum compared with the original before it's kept. Slower, the safest. Report and checksum list go in " + DigiFastBackupEngine.reportsName + " on each drive."
+        }
+    }
+
     @ViewBuilder private var backupSummaryLine: some View {
         if model.syncProgress.isEmpty {
             Text("Ready to back up your session").foregroundStyle(.secondary)
@@ -2855,7 +2930,7 @@ struct ShootWrapView: View {
                     backupActionButtons
                     backupSummaryLine.padding(.leading, 6)
                     Spacer(minLength: 8)
-                    Text("Digi Stream · Size + date").font(.caption).foregroundStyle(.tertiary)
+                    verifyModeMenu
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 10) {
@@ -3070,8 +3145,9 @@ struct ShootWrapView: View {
         destinationSpeedDetail(progress)
         HStack {
             if progress.verifyOn {
-                Label("\(progress.verifiedFiles) of \(progress.completedFiles) copied verified · \(progress.unchangedFiles) unchanged", systemImage: "checkmark.seal")
-                    .help("Each copy is read back from the drive and its xxHash64 checksum compared with the original.")
+                let word: String = progress.readBackOn ? "verified" : "checksummed"
+                Label("\(progress.verifiedFiles) of \(progress.completedFiles) copied " + word + " · \(progress.unchangedFiles) unchanged", systemImage: "checkmark.seal")
+                    .help(progress.readBackOn ? "Each copy is read back from the drive and its xxHash64 checksum compared with the original." : "Quick: each original's xxHash64 checksum was recorded while it copied. Copies weren't read back.")
             } else {
                 Text("\(progress.completedFiles) copied · \(progress.unchangedFiles) unchanged")
             }
@@ -3343,10 +3419,7 @@ struct ShootWrapView: View {
                                 .font(.caption2).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                             Divider()
-                            Toggle("Verify every copy with a checksum (xxHash64)", isOn: $model.verifyCopies).disabled(model.syncBusy)
-                            Text("Each copy is read back from the drive and compared with the original before it's kept, and a backup report plus a checksum list are saved in " + DigiFastBackupEngine.reportsName + " on each drive. Backups take longer with this on.")
-                                .font(.caption2).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            verifyModePicker
                             Toggle("Go easy on the disk while Capture One is open", isOn: $model.gentleWhileCapture).disabled(model.syncBusy)
                             Text("Backups give Capture One first turn at the disk so captures keep landing fast. Backups may run slower while Capture One is open.")
                                 .font(.caption2).foregroundStyle(.secondary)

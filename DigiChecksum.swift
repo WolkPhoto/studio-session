@@ -248,6 +248,16 @@ enum DigiBackupReport {
         let unchangedFiles: Int
         let sourceKeys: Set<String>
         let copiedBytes: Int64
+        /// v1.26: false in Quick mode (copies weren't read back).
+        var readBack: Bool = true
+    }
+
+    /// v1.26: "Capture/LG" for "Capture/LG/Scene_1/a.ARW"; files at the top level group as one.
+    static func group(for relative: String) -> String {
+        let parts = relative.split(separator: "/")
+        if parts.count <= 1 { return "(top level of the session)" }
+        if parts.count == 2 { return String(parts[0]) }
+        return String(parts[0]) + "/" + String(parts[1])
     }
 
     static let checksumFileName = "Checksums.xxh64"
@@ -293,7 +303,7 @@ enum DigiBackupReport {
         // This run's report.
         let stamp = DateFormatter()
         stamp.locale = Locale(identifier: "en_US_POSIX")
-        stamp.dateFormat = "yyyy-MM-dd HHmm"
+        stamp.dateFormat = "yyyy-MM-dd HHmmss"
         let readable = DateFormatter()
         readable.dateStyle = .medium
         readable.timeStyle = .medium
@@ -305,7 +315,8 @@ enum DigiBackupReport {
 
         var text = "STUDIO SESSION BACKUP REPORT\n"
         text += "============================\n\n"
-        text += "Result:    " + (complete ? "COMPLETE, every copied file verified" : "NOT COMPLETE: " + input.status) + "\n\n"
+        let doneLine: String = input.readBack ? "COMPLETE, every copied file verified" : "COMPLETE, originals checksummed (Quick: copies not read back)"
+        text += "Result:    " + (complete ? doneLine : "NOT COMPLETE: " + input.status) + "\n\n"
         text += "Session:   " + input.source.lastPathComponent + "\n"
         text += "From:      " + input.source.path + "\n"
         text += "To:        " + input.destination.path + "\n"
@@ -323,15 +334,36 @@ enum DigiBackupReport {
         if missing > 0 {
             text += "  \(missing) files were copied before checksums were turned on. Check them with Compare > Deep Verify.\n"
         }
-        text += "\nHow files were checked: xxHash64. The original was hashed while it was read,\n"
-        text += "the copy was read back from this drive and hashed again, and the two had to match\n"
-        text += "before the copy was kept. The full list is in " + checksumFileName + " in this folder\n"
+        if input.readBack {
+            text += "\nHow files were checked: xxHash64. The original was hashed while it was read,\n"
+            text += "the copy was read back from this drive and hashed again, and the two had to match\n"
+            text += "before the copy was kept. The full list is in " + checksumFileName + " in this folder\n"
+        } else {
+            text += "\nHow files were checked (Quick): xxHash64 of each original, taken while it was copied.\n"
+            text += "The copies were not read back; check them against " + checksumFileName + " in this folder\n"
+        }
         text += "(check it any time with: cd \"" + input.destination.path + "\" && xxhsum -c \"" + DigiFastBackupEngine.reportsName + "/" + checksumFileName + "\").\n"
+        // v1.26: totals per folder; every file and its checksum is in Checksums.xxh64.
         if !input.verified.isEmpty {
-            text += "\nFILES VERIFIED THIS RUN\n"
-            for (relative, hash) in input.verified.sorted(by: { $0.0 < $1.0 }) {
-                text += XXHash64.hex(hash) + "  " + relative + "\n"
+            var groups: [String: (files: Int, bytes: Int64)] = [:]
+            for (relative, _) in input.verified {
+                let key = group(for: relative)
+                let size = (try? fm.attributesOfItem(atPath: input.destination.appendingPathComponent(relative).path))?[.size] as? NSNumber
+                var entry: (files: Int, bytes: Int64) = groups[key] ?? (files: 0, bytes: 0)
+                entry.files += 1
+                entry.bytes += size?.int64Value ?? 0
+                groups[key] = entry
             }
+            text += "\nCOPIED THIS RUN, BY FOLDER\n"
+            let ordered = groups.keys.sorted()
+            for key in ordered.prefix(80) {
+                if let entry = groups[key] {
+                    let size = ByteCountFormatter.string(fromByteCount: entry.bytes, countStyle: .file)
+                    text += "  " + key + ":  \(entry.files) files, " + size + "\n"
+                }
+            }
+            if ordered.count > 80 { text += "  …and \(ordered.count - 80) more folders\n" }
+            text += "Every file and its checksum: " + checksumFileName + "\n"
         }
         text += "\nSigned: ______________________________    Date: ______________\n"
 

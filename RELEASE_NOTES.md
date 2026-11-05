@@ -1,7 +1,9 @@
-Studio Session 1.25
+Studio Session 1.26
 
-- Every copy is verified: the original is checksummed (xxHash64) while it's read, the copy is read back from the drive and checked before it's kept. Each drive gets a backup report and a full checksum list in _StudioSession_Reports.
-- Backups go easy on the disk while Capture One is open, and the app checks Capture One far less often.
-- Archive: new copies go in _StudioSession_Archive. See how big it is on each drive, clear it (with a confirmation), or have the oldest copies cleared automatically when a drive runs low.
-- Check for Updates in the Studio Session menu.
-- Metadata is hidden for now.
+- Faster verified backups: each large file is read back while the next one copies.
+- Choose how copies are checked, right on the backup screen: Full verify (read every copy back), Quick (checksum originals, about normal speed) or Off.
+- Shorter backup reports: totals per folder. Every file's checksum stays in Checksums.xxh64.
+- Time left shows in the sidebar backup panel, and Pause has a pause icon.
+- Check waits for a running backup, then starts on its own.
+- New backup folders on connected drives are named after the folder being backed up.
+- Clearer message when ejecting a drive that's already unplugged.
