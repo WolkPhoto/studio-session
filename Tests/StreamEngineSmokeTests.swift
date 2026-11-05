@@ -209,10 +209,10 @@ enum StreamEngineSmokeTests {
             let original = try DigiChecksum.hashFile(source.appendingPathComponent(relative), uncached: false)
             try check(XXHash64.hex(original) == hash, "Listed checksum doesn't match the original: " + relative)
         }
-        let again = await DigiStreamEngine.sync(source: source, destination: verifyTarget, archiveChanged: true, archiveRemoved: true,
+        let verifiedAgain = await DigiStreamEngine.sync(source: source, destination: verifyTarget, archiveChanged: true, archiveRemoved: true,
             filter: BackupFilter(), control: BackupControl(), verify: true, report: { _ in })
-        try check(again.status == DigiFastBackupEngine.completeStatus && again.completedFiles == 0, "Verified incremental copied again")
-        try check(again.reportPath.isEmpty, "An incremental with nothing new wrote another report")
+        try check(verifiedAgain.status == DigiFastBackupEngine.completeStatus && verifiedAgain.completedFiles == 0, "Verified incremental copied again")
+        try check(verifiedAgain.reportPath.isEmpty, "An incremental with nothing new wrote another report")
         let backupScan = try DigiFastBackupEngine.snapshot(verifyTarget, filter: BackupFilter())
         try check(!backupScan.files.contains { $0.relative.hasPrefix(DigiFastBackupEngine.reportsName) }, "Report folder was treated as shoot files")
         print("PASS (v1.25): xxHash64 test values, verified copies, checksum list and report")
