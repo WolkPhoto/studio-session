@@ -18,6 +18,8 @@ struct DigiDriveLine: Identifiable {
     let lastBackup: Date?
     /// v1.26: seconds left on this drive while it copies.
     var eta: Double? = nil
+    /// v1.28: in Full verify's read-back pass.
+    var verifying: Bool = false
 }
 
 struct DigiBackupSnapshot {
@@ -108,7 +110,8 @@ struct DigiBackupSnapshot {
                 status = "Not connected"
             }
             lines.append(DigiDriveLine(id: path, name: destination.lastPathComponent, fraction: fraction,
-                                       status: status, mbps: mbps, state: state, lastBackup: last, eta: driveETA))
+                                       status: status, mbps: mbps, state: state, lastBackup: last, eta: driveETA,
+                                       verifying: progress?.status.hasPrefix("Verifying") == true))
         }
         var overall: Double = 0
         if total > 0 { overall = Double(done) / Double(total) }
@@ -252,7 +255,8 @@ func digiStateWord(_ line: DigiDriveLine) -> String {
     switch line.state {
     case .copying:
         let left = DigiBackupSnapshot.etaText(line.eta)
-        let percent = "Copying \(Int((line.fraction * 100).rounded()))%"
+        let word: String = line.verifying ? "Verifying" : "Copying"
+        let percent = word + " \(Int((line.fraction * 100).rounded()))%"
         return left.isEmpty ? percent : percent + " · " + left
     case .paused: return "Paused"
     case .queued: return "Waiting its turn"

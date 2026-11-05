@@ -242,6 +242,13 @@ enum StreamEngineSmokeTests {
             .appendingPathComponent(DigiBackupReport.checksumFileName))
         try check(renamedList["Capture/Boundary_renamed.ARW"] == list["Capture/Boundary.ARW"] && renamedList["Capture/Boundary.ARW"] == nil, "Checksum list didn't follow the rename")
         try fm.moveItem(at: newName, to: oldName)
+        // v1.28: a drive check against its own checksum list finds changed and missing files.
+        let cleanCheck = try DigiChecksumListCheck.run(verifyTarget, control: BackupControl(), progress: { _, _, _ in })
+        try check(cleanCheck.passed && cleanCheck.matched == cleanCheck.listed, "Drive check failed on a good backup")
+        let tampered = verifyTarget.appendingPathComponent("Settings/Big1.ARW.cos")
+        try Data("<changed/>".utf8).write(to: tampered)
+        let badCheck = try DigiChecksumListCheck.run(verifyTarget, control: BackupControl(), progress: { _, _, _ in })
+        try check(!badCheck.passed && badCheck.different == ["Settings/Big1.ARW.cos"], "Drive check missed a changed file")
         print("PASS (v1.25): xxHash64 test values, verified copies, checksum list and report")
 
         // 9. v1.25: archive trim and clear touch only the archive folders, oldest first.

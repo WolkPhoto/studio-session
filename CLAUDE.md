@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.27.0 (folder `DigiFour_1_27`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.28.0 (folder `DigiFour_1_28`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -401,3 +401,21 @@ the lineup and build commands. 1.0 compiled clean on the first try (Nov 2, 7:28)
   (Quick: "N copied, checksummed"); SyncProgress.checksummedFiles.
 - Report: "Copied this run (read back and verified | checksummed)", renamed, re-copied and archived
   counts, "1 file" plurals, method text for verify-after-copy, stopped-during-verify note.
+
+### 1.27 test results (Nov 5, T7, Capture One closed)
+- Full verify (copy, then read back), new folder after a large delete: 13:23. Copy ~7 min at ~600 MB/s,
+  read-back ~6 min at ~680-700 MB/s (the T7's read speed). Files fully on the drive at ~7 min.
+- Rename test vs that backup: 38 copied (50 MB: Capture One .cos settings + session db), 140 renamed
+  (raw + previews), 39 archived (50 MB), 5 s. 1.26 copied 188 files / 2.5 GB for a similar rename.
+- Jeff: keep Full verify the default. Launch update check stays silent unless there's an update
+  ("You're up to date" only from the menu).
+
+### 1.28
+- Copy speed and verify time apart: SyncProgress.copyPhaseSeconds / verifyPhaseSeconds; bytesPerSecond
+  frozen when the read-back pass starts (copyRateFrozen). DigiLastBackup.verifySeconds (optional):
+  "Last backup: … copied in 7m 02s at 607 MB/s, verified in 6m 21s".
+- Sidebar says "Verifying 68%" in the read-back pass (DigiDriveLine.verifying).
+- Short backups: no empty graph or legend, no "Peak 0.0 MB/s".
+- Check > "Check a Drive by Its Checksum List…" (DigiChecksumListCheck in DigiChecksum.swift, tested):
+  reads every file in a backup's Checksums.xxh64 back from the drive, no session needed; alert with
+  match / missing / different counts and Open Report; "<date> Drive Check.txt" in _StudioSession_Reports.

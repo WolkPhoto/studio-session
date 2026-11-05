@@ -44,6 +44,9 @@ struct SyncProgress: Identifiable, Sendable {
     var renamedFiles = 0
     /// v1.27: copies that failed their check and were copied again successfully.
     var repairedFiles = 0
+    /// v1.28: how long copying took, and the read-back pass, separately.
+    var copyPhaseSeconds: Double = 0
+    var verifyPhaseSeconds: Double = 0
     var verifiedFiles = 0
     var reportPath = ""
     // v1.25: what the automatic archive clean-up did on this drive, if anything.

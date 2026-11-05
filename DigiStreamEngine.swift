@@ -328,6 +328,7 @@ enum DigiStreamEngine {
         let pipelineReadBack: Bool = false
         let postVerify: Bool = verify && readBack
         var verifying = false
+        var copyRateFrozen = false
         let checkedBytes = ByteCounter()
         var copiedChecks: [(String, UInt64)] = []
         var archivedCount = 0
@@ -360,7 +361,7 @@ enum DigiStreamEngine {
             let activeSeconds: Double = state.elapsedSeconds - state.planSeconds - pausedSeconds
             let transferElapsed: Double = max(0.001, activeSeconds)
             // Copy speed stays the copy speed; the read-back pass doesn't change it.
-            if !verifying { state.bytesPerSecond = Double(copiedNow) / transferElapsed }
+            if !copyRateFrozen { state.bytesPerSecond = Double(copiedNow) / transferElapsed }
             // v1.27: time left covers the read-back pass too (copy + read = the work).
             let workTotal: Int64 = postVerify ? state.totalBytes * 2 : state.totalBytes
             let workDone: Int64 = copiedNow + checkedNow
@@ -773,7 +774,10 @@ enum DigiStreamEngine {
                 temporaries.remove(temporary)
                 state.repairedFiles += 1
             }
+            if !changes.isEmpty { state.copyPhaseSeconds = Date().timeIntervalSince(copyStarted) }
             if postVerify && !copiedChecks.isEmpty {
+                await publish(force: true)
+                copyRateFrozen = true
                 verifying = true
                 state.verifyPhase = true
                 state.readSampleStart = state.speedSamples.count
@@ -809,6 +813,7 @@ enum DigiStreamEngine {
                     state.verifiedFiles += 1
                 }
                 verifying = false
+                state.verifyPhaseSeconds = Date().timeIntervalSince(phaseStart)
                 state.status = "Finishing…"
                 await publish(force: true)
             }

@@ -184,6 +184,8 @@ struct FolderCompareView: View {
     @State private var snapshots: [CompareSnapshot] = []
     @State private var expanded: Set<String> = []
     @State private var running = false
+    /// v1.28: checking one backup against its own checksum list.
+    @State private var listCheckControl: BackupControl?
     @State private var verifyTracker: DeepVerifyTracker? = nil
     @State private var verifyProgress: Double = 0
     @State private var verifyDetails = ""
@@ -423,6 +425,15 @@ struct FolderCompareView: View {
                         progress = "Folders or settings changed. Click Refresh to compare."
                     }
                 Spacer()
+                if listCheckControl != nil {
+                    Button("Stop Drive Check") { listCheckControl?.stop() }
+                } else {
+                    Button { startListCheck() } label: {
+                        Label("Check a Drive by Its Checksum List…", systemImage: "checkmark.seal")
+                    }
+                    .disabled(running)
+                    .help("Checks a Studio Session backup against the checksums saved when it was made. The original session isn't needed.")
+                }
                 Button(role: .destructive) {
                     roots = []; linkedToDashboard = false; results = []; snapshots = []; expanded = []
                     progress = "Cleared. Drop folders or click Add Folder to start again."
@@ -784,6 +795,73 @@ struct FolderCompareView: View {
     /// Version 20.9: scan when the tab is opened. Nothing runs in the
     /// background on other tabs. Deep Verify reads every byte, so it still
     /// waits for Refresh.
+    /// v1.28: pick a backup folder, read every file listed in its Checksums.xxh64
+    /// back from the drive, and say plainly what matched, what's missing and what changed.
+    private func startListCheck() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Check This Backup"
+        panel.message = "Choose a Studio Session backup folder (the one with _StudioSession_Reports inside)."
+        if let first = backupDestinations.first { panel.directoryURL = first }
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        guard DigiChecksumListCheck.hasList(folder) else {
+            let alert = NSAlert()
+            alert.messageText = "No checksum list in this folder"
+            alert.informativeText = folder.lastPathComponent + " has no " + DigiFastBackupEngine.reportsName + "/" + DigiBackupReport.checksumFileName + ". Studio Session makes one when it backs up with checksums on (Full verify or Quick). To check this folder another way, add it here with the session and use Deep Verify."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        let control = BackupControl()
+        listCheckControl = control
+        progress = "Checking " + folder.lastPathComponent + " against its checksum list…"
+        let gate = ListCheckThrottle()
+        Task.detached(priority: .userInitiated) {
+            var outcome: DigiChecksumListCheck.Outcome?
+            var failure: String?
+            do {
+                outcome = try DigiChecksumListCheck.run(folder, control: control) { done, total, file in
+                    guard gate.due() else { return }
+                    let line = "Checking drive: \(done.formatted()) of \(total.formatted()) · " + file
+                    DispatchQueue.main.async { progress = line }
+                }
+            } catch {
+                failure = error.localizedDescription
+            }
+            let result = outcome
+            let problem = failure
+            await MainActor.run {
+                listCheckControl = nil
+                guard let result else {
+                    progress = "Drive check stopped. " + (problem ?? "")
+                    return
+                }
+                let reportPath = DigiChecksumListCheck.writeReport(result, backup: folder)
+                let alert = NSAlert()
+                if result.passed {
+                    alert.messageText = "Every file matches"
+                    alert.informativeText = DigiBackupReport.files(result.matched) + " on " + folder.lastPathComponent + " match the checksums saved when they were backed up."
+                    progress = "Drive check passed: " + DigiBackupReport.files(result.matched) + " match."
+                } else {
+                    alert.alertStyle = .warning
+                    alert.messageText = "Problems found on " + folder.lastPathComponent
+                    var lines: [String] = []
+                    if !result.missing.isEmpty { lines.append(DigiBackupReport.files(result.missing.count) + " missing") }
+                    if !result.different.isEmpty { lines.append(DigiBackupReport.files(result.different.count) + " different from when they were backed up") }
+                    alert.informativeText = lines.joined(separator: ", ") + ". " + DigiBackupReport.files(result.matched) + " match. The report lists every file. Back up again from the original session if you still have it."
+                    progress = "Drive check found problems: " + lines.joined(separator: ", ") + "."
+                }
+                alert.addButton(withTitle: "OK")
+                if reportPath != nil { alert.addButton(withTitle: "Open Report") }
+                if alert.runModal() == .alertSecondButtonReturn, let reportPath {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: reportPath))
+                }
+            }
+        }
+    }
+
     private func autoRefresh() {
         guard isActive, !running, roots.count >= 2 else { return }
         if !autoRefreshAllowed {
@@ -935,5 +1013,20 @@ struct FolderCompareView: View {
             try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
             progress = "Exported \(url.lastPathComponent)"
         } catch { progress = "Export failed: \(error.localizedDescription)" }
+    }
+}
+
+
+/// v1.28: keeps the drive check's progress line to a few updates a second.
+final class ListCheckThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+    func due() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        if now.timeIntervalSince(last) < 0.25 { return false }
+        last = now
+        return true
     }
 }

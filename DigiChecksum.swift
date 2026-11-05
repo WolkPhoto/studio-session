@@ -401,3 +401,83 @@ enum DigiBackupReport {
         return reportURL.path
     }
 }
+
+/// v1.28: checks a backup against its own Checksums.xxh64, with no need for the
+/// original session. For a drive weeks later, before handing it over or archiving.
+enum DigiChecksumListCheck {
+    struct Outcome: Sendable {
+        var listed = 0
+        var matched = 0
+        var missing: [String] = []
+        var different: [String] = []
+        var bytesRead: Int64 = 0
+        var seconds: Double = 0
+        var passed: Bool { listed > 0 && missing.isEmpty && different.isEmpty }
+    }
+
+    static func listURL(for backup: URL) -> URL {
+        backup.appendingPathComponent(DigiFastBackupEngine.reportsName).appendingPathComponent(DigiBackupReport.checksumFileName)
+    }
+
+    static func hasList(_ backup: URL) -> Bool {
+        FileManager.default.fileExists(atPath: listURL(for: backup).path)
+    }
+
+    /// Reads every listed file back from the drive and compares checksums.
+    static func run(_ backup: URL, control: BackupControl,
+                    progress: @Sendable (Int, Int, String) -> Void) throws -> Outcome {
+        let started = Date()
+        let list = DigiBackupReport.readChecksums(listURL(for: backup))
+        var outcome = Outcome()
+        outcome.listed = list.count
+        let counter = DigiStreamEngine.ByteCounter()
+        let fm = FileManager()
+        let keys = list.keys.sorted()
+        for (index, relative) in keys.enumerated() {
+            try control.checkStopped()
+            progress(index + 1, keys.count, relative)
+            let url = backup.appendingPathComponent(relative)
+            guard fm.fileExists(atPath: url.path) else { outcome.missing.append(relative); continue }
+            let hash = try DigiChecksum.hashFile(url, uncached: true, control: control, counted: counter)
+            if XXHash64.hex(hash) == list[relative] { outcome.matched += 1 } else { outcome.different.append(relative) }
+        }
+        outcome.bytesRead = counter.value
+        outcome.seconds = Date().timeIntervalSince(started)
+        return outcome
+    }
+
+    /// Saves "<date> Drive Check.txt" next to the checksum list.
+    static func writeReport(_ outcome: Outcome, backup: URL) -> String? {
+        let stamp = DateFormatter()
+        stamp.locale = Locale(identifier: "en_US_POSIX")
+        stamp.dateFormat = "yyyy-MM-dd HHmmss"
+        let readable = DateFormatter()
+        readable.dateStyle = .medium
+        readable.timeStyle = .medium
+        let volume = (try? backup.resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? backup.lastPathComponent
+        var text = "STUDIO SESSION DRIVE CHECK\n==========================\n\n"
+        text += "Result:    " + (outcome.passed ? "PASSED, every listed file matches its checksum" : "PROBLEMS FOUND") + "\n\n"
+        text += "Backup:    " + backup.path + "\n"
+        text += "Drive:     " + volume + "\n"
+        text += "Checked:   " + readable.string(from: Date()) + "\n\n"
+        text += "Files on the checksum list:  " + DigiBackupReport.files(outcome.listed) + "\n"
+        text += "Match:      " + DigiBackupReport.files(outcome.matched) + "\n"
+        text += "Missing:    " + DigiBackupReport.files(outcome.missing.count) + "\n"
+        text += "Different:  " + DigiBackupReport.files(outcome.different.count) + "\n"
+        text += "Read:       " + ByteCountFormatter.string(fromByteCount: outcome.bytesRead, countStyle: .file) + "\n"
+        if !outcome.missing.isEmpty {
+            text += "\nMISSING\n" + outcome.missing.map { "  " + $0 }.joined(separator: "\n") + "\n"
+        }
+        if !outcome.different.isEmpty {
+            text += "\nDIFFERENT FROM WHEN IT WAS BACKED UP\n" + outcome.different.map { "  " + $0 }.joined(separator: "\n") + "\n"
+        }
+        let url = backup.appendingPathComponent(DigiFastBackupEngine.reportsName)
+            .appendingPathComponent(stamp.string(from: Date()) + " Drive Check.txt")
+        do {
+            try Data(text.utf8).write(to: url, options: .atomic)
+            return url.path
+        } catch {
+            return nil
+        }
+    }
+}

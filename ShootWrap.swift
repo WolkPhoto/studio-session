@@ -377,9 +377,12 @@ struct ShootWrapProject: Codable {
     }
     func recordBackup(_ result: SyncProgress) {
         guard result.status == DigiFastBackupEngine.completeStatus else { return }
-        let record = DigiLastBackup(date: Date(), seconds: result.elapsedSeconds,
+        // v1.28: copy time and copy speed, with the read-back pass listed on its own.
+        let copySeconds: Double = result.copyPhaseSeconds > 0 ? result.copyPhaseSeconds : result.elapsedSeconds
+        var record = DigiLastBackup(date: Date(), seconds: copySeconds,
                                     averageMBps: result.bytesPerSecond / 1_000_000,
                                     copiedFiles: result.completedFiles, copiedBytes: result.completedBytes)
+        if result.verifyPhaseSeconds > 0 { record.verifySeconds = result.verifyPhaseSeconds }
         lastBackups[result.destination] = record
         if let data = try? JSONEncoder().encode(lastBackups) {
             UserDefaults.standard.set(data, forKey: Self.lastBackupsKey)
@@ -2805,16 +2808,20 @@ struct ShootWrapView: View {
             let now: Double = currentSpeed(item)
             let remaining: Int64 = max(Int64(0), item.totalBytes - item.completedBytes)
             let running: Bool = model.syncBusy && !destinationFinished(item)
+            // v1.28: a backup too short to draw a graph shows no empty graph.
+            let hasGraph: Bool = running || item.speedSamples.count > 1
             HStack(spacing: 8) {
                 if running { Text("Now " + mbps(now)) }
                 Text("Avg " + mbps(item.bytesPerSecond / 1_000_000))
-                Text("Peak " + mbps(item.peakMBps))
+                if item.peakMBps > 0 { Text("Peak " + mbps(item.peakMBps)) }
                 Spacer(minLength: 4)
             }
             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            DigiSpeedSparkline(samples: item.speedSamples, peak: item.peakMBps, height: 70,
-                               readStart: item.readSampleStart, sampleSeconds: item.sampleSeconds)
-            if item.readSampleStart != nil {
+            if hasGraph {
+                DigiSpeedSparkline(samples: item.speedSamples, peak: item.peakMBps, height: 70,
+                                   readStart: item.readSampleStart, sampleSeconds: item.sampleSeconds)
+            }
+            if hasGraph && item.readSampleStart != nil {
                 HStack(spacing: 12) {
                     Label("Copying", systemImage: "circle.fill").foregroundStyle(DigiBrand.accent)
                     Label("Reading back to verify", systemImage: "circle.fill").foregroundStyle(Color(red: 0.36, green: 0.72, blue: 0.95))
@@ -3068,8 +3075,9 @@ struct ShootWrapView: View {
         else { when = last.date.formatted(date: .abbreviated, time: .shortened) }
         var text: String = "Last backup: " + when
         if last.copiedFiles > 0 {
-            text += " · \(last.copiedFiles) files, " + bytes(last.copiedBytes) + " in " + durationText(last.seconds)
+            text += " · \(last.copiedFiles) files, " + bytes(last.copiedBytes) + " copied in " + durationText(last.seconds)
             if last.averageMBps > 1 { text += String(format: " at %.0f MB/s", last.averageMBps) }
+            if let verify = last.verifySeconds { text += ", verified in " + durationText(verify) }
         } else {
             text += " · already up to date"
         }
@@ -4755,6 +4763,8 @@ struct DigiLastBackup: Codable, Equatable {
     let averageMBps: Double
     let copiedFiles: Int
     let copiedBytes: Int64
+    /// v1.28: Full verify's read-back pass, shown apart from the copy time.
+    var verifySeconds: Double? = nil
 }
 
 
