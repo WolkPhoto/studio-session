@@ -169,7 +169,8 @@ enum DigiChecksum {
 
     /// Hashes a whole file. With `uncached`, asks macOS to read it from the
     /// drive instead of memory (used when reading a fresh copy back).
-    static func hashFile(_ url: URL, uncached: Bool, control: BackupControl? = nil) throws -> UInt64 {
+    static func hashFile(_ url: URL, uncached: Bool, control: BackupControl? = nil,
+                         counted: DigiStreamEngine.ByteCounter? = nil) throws -> UInt64 {
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
         guard descriptor >= 0 else { throw DigiStreamEngine.posixFailure("Could not open", url.path) }
         defer { close(descriptor) }
@@ -192,6 +193,7 @@ enum DigiChecksum {
             }
             if count == 0 { break }
             hasher.update(UnsafeRawPointer(buffer), count: count)
+            counted?.add(Int64(count))
         }
         return hasher.finish()
     }
@@ -250,7 +252,14 @@ enum DigiBackupReport {
         let copiedBytes: Int64
         /// v1.26: false in Quick mode (copies weren't read back).
         var readBack: Bool = true
+        /// v1.27: copies read back and matched, renames, archived and re-copied files.
+        var readBackDone: Int = 0
+        var renamedPaths: Set<String> = []
+        var archived: Int = 0
+        var repaired: Int = 0
     }
+
+    static func files(_ count: Int) -> String { count == 1 ? "1 file" : "\(count) files" }
 
     /// v1.26: "Capture/LG" for "Capture/LG/Scene_1/a.ARW"; files at the top level group as one.
     static func group(for relative: String) -> String {
@@ -312,11 +321,16 @@ enum DigiBackupReport {
         let missing = input.sourceKeys.filter { list[$0] == nil }.count
         let complete = input.status == DigiFastBackupEngine.completeStatus
         let byteText = ByteCountFormatter.string(fromByteCount: input.copiedBytes, countStyle: .file)
+        let copiedCount = input.verified.filter { !input.renamedPaths.contains($0.0) }.count
 
         var text = "STUDIO SESSION BACKUP REPORT\n"
         text += "============================\n\n"
-        let doneLine: String = input.readBack ? "COMPLETE, every copied file verified" : "COMPLETE, originals checksummed (Quick: copies not read back)"
-        text += "Result:    " + (complete ? doneLine : "NOT COMPLETE: " + input.status) + "\n\n"
+        let doneLine: String = input.readBack ? "COMPLETE, every copy read back and verified" : "COMPLETE, originals checksummed (Quick: copies not read back)"
+        var notDone: String = "NOT COMPLETE: " + input.status
+        if input.readBack && input.readBackDone < copiedCount {
+            notDone += " (\(input.readBackDone) of \(copiedCount) copies verified before it stopped)"
+        }
+        text += "Result:    " + (complete ? doneLine : notDone) + "\n\n"
         text += "Session:   " + input.source.lastPathComponent + "\n"
         text += "From:      " + input.source.path + "\n"
         text += "To:        " + input.destination.path + "\n"
@@ -328,25 +342,35 @@ enum DigiBackupReport {
         }
         text += "Started:   " + readable.string(from: input.started) + "\n"
         text += "Finished:  " + readable.string(from: input.finished) + "\n\n"
-        text += "Copied and verified this run:  \(input.verified.count) files, " + byteText + "\n"
-        text += "Already on the drive, unchanged:  \(input.unchangedFiles) files\n"
+        let copiedHow: String = input.readBack ? "read back and verified" : "checksummed"
+        text += "Copied this run (" + copiedHow + "):  " + files(copiedCount) + ", " + byteText + "\n"
+        if !input.renamedPaths.isEmpty {
+            text += "Renamed on the drive to match the session (no copy needed):  " + files(input.renamedPaths.count) + "\n"
+        }
+        if input.repaired > 0 {
+            text += "Failed a check and were copied again, then verified:  " + files(input.repaired) + "\n"
+        }
+        if input.archived > 0 {
+            text += "Older versions moved to the archive:  " + files(input.archived) + "\n"
+        }
+        text += "Already on the drive, unchanged:  " + files(input.unchangedFiles) + "\n"
         text += "Files in this backup with a checksum on record:  \(input.sourceKeys.count - missing) of \(input.sourceKeys.count)\n"
         if missing > 0 {
             text += "  \(missing) files were copied before checksums were turned on. Check them with Compare > Deep Verify.\n"
         }
         if input.readBack {
-            text += "\nHow files were checked: xxHash64. The original was hashed while it was read,\n"
-            text += "the copy was read back from this drive and hashed again, and the two had to match\n"
-            text += "before the copy was kept. The full list is in " + checksumFileName + " in this folder\n"
+            text += "\nHow files were checked: xxHash64. Each original was hashed while it was copied.\n"
+            text += "After copying, every new copy was read back from this drive and hashed again; a copy\n"
+            text += "that didn't match was copied again and rechecked. The full list is in " + checksumFileName + " in this folder\n"
         } else {
             text += "\nHow files were checked (Quick): xxHash64 of each original, taken while it was copied.\n"
             text += "The copies were not read back; check them against " + checksumFileName + " in this folder\n"
         }
         text += "(check it any time with: cd \"" + input.destination.path + "\" && xxhsum -c \"" + DigiFastBackupEngine.reportsName + "/" + checksumFileName + "\").\n"
         // v1.26: totals per folder; every file and its checksum is in Checksums.xxh64.
-        if !input.verified.isEmpty {
+        if copiedCount > 0 {
             var groups: [String: (files: Int, bytes: Int64)] = [:]
-            for (relative, _) in input.verified {
+            for (relative, _) in input.verified where !input.renamedPaths.contains(relative) {
                 let key = group(for: relative)
                 let size = (try? fm.attributesOfItem(atPath: input.destination.appendingPathComponent(relative).path))?[.size] as? NSNumber
                 var entry: (files: Int, bytes: Int64) = groups[key] ?? (files: 0, bytes: 0)
@@ -359,7 +383,7 @@ enum DigiBackupReport {
             for key in ordered.prefix(80) {
                 if let entry = groups[key] {
                     let size = ByteCountFormatter.string(fromByteCount: entry.bytes, countStyle: .file)
-                    text += "  " + key + ":  \(entry.files) files, " + size + "\n"
+                    text += "  " + key + ":  " + files(entry.files) + ", " + size + "\n"
                 }
             }
             if ordered.count > 80 { text += "  …and \(ordered.count - 80) more folders\n" }

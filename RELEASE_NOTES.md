@@ -1,9 +1,7 @@
-Studio Session 1.26
+Studio Session 1.27
 
-- Faster verified backups: each large file is read back while the next one copies.
-- Choose how copies are checked, right on the backup screen: Full verify (read every copy back), Quick (checksum originals, about normal speed) or Off.
-- Shorter backup reports: totals per folder. Every file's checksum stays in Checksums.xxh64.
-- Time left shows in the sidebar backup panel, and Pause has a pause icon.
-- Check waits for a running backup, then starts on its own.
-- New backup folders on connected drives are named after the folder being backed up.
-- Clearer message when ejecting a drive that's already unplugged.
+- Full verify copies everything at full speed first, then reads every copy back in one pass. Any copy that doesn't match is copied again and rechecked.
+- Renamed files (for example a batch rename in Capture One) are renamed on the backup drive instead of copied again, after their contents are confirmed to match.
+- Hover over the speed graph to see the speed, time and amount at any moment. The read-back pass shows in blue.
+- The checksum choice sits next to Start Backup, with a one-line explanation.
+- Reports list renamed files, re-copied files and files moved to the archive.

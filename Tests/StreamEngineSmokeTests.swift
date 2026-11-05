@@ -220,13 +220,28 @@ enum StreamEngineSmokeTests {
         try fm.createDirectory(at: quickTarget, withIntermediateDirectories: false)
         let quick = await DigiStreamEngine.sync(source: source, destination: quickTarget, archiveChanged: true, archiveRemoved: true,
             filter: BackupFilter(), control: BackupControl(), verify: true, readBack: false, report: { _ in })
-        try check(quick.errorCount == 0 && quick.verifiedFiles == quick.completedFiles, "Quick backup failed: " + quick.status)
+        try check(quick.errorCount == 0 && quick.checksummedFiles == quick.completedFiles, "Quick backup failed: " + quick.status)
         let quickList = DigiBackupReport.readChecksums(quickTarget.appendingPathComponent(DigiFastBackupEngine.reportsName)
             .appendingPathComponent(DigiBackupReport.checksumFileName))
         try check(quickList == list, "Quick and full checksums differ")
         let quickReport = try String(contentsOfFile: quick.reportPath, encoding: .utf8)
         try check(quickReport.contains("Quick"), "Quick report doesn't say Quick")
         try check(DigiBackupReport.group(for: "Capture/LG/Scene/a.ARW") == "Capture/LG", "Report folder grouping is wrong")
+
+        // v1.27: a file renamed in the session is renamed on the backup, not copied again.
+        let oldName = source.appendingPathComponent("Capture/Boundary.ARW")
+        let newName = source.appendingPathComponent("Capture/Boundary_renamed.ARW")
+        try fm.moveItem(at: oldName, to: newName)
+        let renamedRun = await DigiStreamEngine.sync(source: source, destination: quickTarget, archiveChanged: true, archiveRemoved: true,
+            filter: BackupFilter(), control: BackupControl(), verify: true, readBack: false, report: { _ in })
+        try check(renamedRun.errorCount == 0, "Rename backup failed: " + renamedRun.status)
+        try check(renamedRun.renamedFiles == 1 && renamedRun.completedFiles == 0, "Rename was copied instead of renamed (renamed \(renamedRun.renamedFiles), copied \(renamedRun.completedFiles))")
+        try check(fm.fileExists(atPath: quickTarget.appendingPathComponent("Capture/Boundary_renamed.ARW").path), "Renamed file missing on the backup")
+        try check(!fm.fileExists(atPath: quickTarget.appendingPathComponent("Capture/Boundary.ARW").path), "Old name still on the backup")
+        let renamedList = DigiBackupReport.readChecksums(quickTarget.appendingPathComponent(DigiFastBackupEngine.reportsName)
+            .appendingPathComponent(DigiBackupReport.checksumFileName))
+        try check(renamedList["Capture/Boundary_renamed.ARW"] == list["Capture/Boundary.ARW"] && renamedList["Capture/Boundary.ARW"] == nil, "Checksum list didn't follow the rename")
+        try fm.moveItem(at: newName, to: oldName)
         print("PASS (v1.25): xxHash64 test values, verified copies, checksum list and report")
 
         // 9. v1.25: archive trim and clear touch only the archive folders, oldest first.

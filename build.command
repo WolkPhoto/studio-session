@@ -8,8 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="1.26.0"
-BUILD="48"
+VERSION="1.27.0"
+BUILD="49"
 # v1.25: where Check for Updates looks (github.com/<owner>/<repo>/releases).
 UPDATE_REPO="${UPDATE_REPO:-$(cat UPDATE_REPO.txt 2>/dev/null | tr -d '[:space:]' || true)}"
 APP_NAME="${APP_NAME:-Digi Suite}"

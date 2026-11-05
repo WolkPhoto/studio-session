@@ -69,7 +69,11 @@ struct DigiBackupSnapshot {
                 let isProblem = progress.status.hasPrefix("Error") || progress.status == "Source Unavailable" ||
                     progress.status == DigiDestinationLock.busyStatus
                 if progress.totalBytes > 0 {
-                    let ratio = Double(progress.completedBytes) / Double(progress.totalBytes)
+                    // v1.27: Full verify counts copying and reading back, half each.
+                    var ratio = Double(progress.completedBytes) / Double(progress.totalBytes)
+                    if progress.readBackOn {
+                        ratio = Double(progress.completedBytes + progress.verifiedBytes) / Double(progress.totalBytes * 2)
+                    }
                     fraction = min(1, max(0, ratio))
                 } else if isComplete {
                     fraction = 1
@@ -93,8 +97,10 @@ struct DigiBackupSnapshot {
                     driveETA = left
                     longest = max(longest ?? 0, left)
                 }
-                total += progress.totalBytes
-                done += min(progress.completedBytes, progress.totalBytes)
+                let work: Int64 = progress.readBackOn ? progress.totalBytes * 2 : progress.totalBytes
+                let workDone: Int64 = progress.readBackOn ? progress.completedBytes + progress.verifiedBytes : progress.completedBytes
+                total += work
+                done += min(workDone, work)
                 speed += mbps
             }
             if !available && state != .done && state != .copying {

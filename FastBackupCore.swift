@@ -33,6 +33,17 @@ struct SyncProgress: Identifiable, Sendable {
     var verifyOn = false
     /// v1.26: false in Quick mode (originals checksummed, copies not read back).
     var readBackOn = false
+    /// v1.27: copies with a checksum of the original (counted while copying).
+    var checksummedFiles = 0
+    /// v1.27: Full verify reads copies back in a pass after copying.
+    var verifyPhase = false
+    var verifiedBytes: Int64 = 0
+    /// Index in speedSamples where the read-back pass starts (drawn differently).
+    var readSampleStart: Int?
+    /// v1.27: renamed in the session, so renamed on the backup instead of copied.
+    var renamedFiles = 0
+    /// v1.27: copies that failed their check and were copied again successfully.
+    var repairedFiles = 0
     var verifiedFiles = 0
     var reportPath = ""
     // v1.25: what the automatic archive clean-up did on this drive, if anything.

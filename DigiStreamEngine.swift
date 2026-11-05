@@ -255,6 +255,58 @@ enum DigiStreamEngine {
         }
     }
 
+    // MARK: Renamed files (v1.27)
+
+    /// A file that left the session and one that arrived with the same size,
+    /// date and file type, confirmed to have the same contents.
+    struct RenameMatch: Sendable {
+        let from: String
+        let to: BackupEntry
+        let checksum: UInt64
+    }
+
+    /// Contents are always compared: the original's xxHash64 against the backup
+    /// copy's recorded checksum, or against the backup copy itself when none is on record.
+    static func findRenames(changes: [BackupEntry], removed: [String], root: URL,
+                            recorded: [String: String], control: BackupControl) throws -> [RenameMatch] {
+        let fm = FileManager()
+        var bySize: [Int64: [(relative: String, modified: Date)]] = [:]
+        for relative in removed {
+            let url = root.appendingPathComponent(relative)
+            guard let attributes = try? fm.attributesOfItem(atPath: url.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  let size = (attributes[.size] as? NSNumber)?.int64Value,
+                  let modified = attributes[.modificationDate] as? Date else { continue }
+            bySize[size, default: []].append((relative: relative, modified: modified))
+        }
+        guard !bySize.isEmpty else { return [] }
+        var used = Set<String>()
+        var matches: [RenameMatch] = []
+        for entry in changes {
+            try control.checkStopped()
+            guard let candidates = bySize[entry.size], !fm.fileExists(atPath: entry.destination.path) else { continue }
+            let kind = (entry.relative as NSString).pathExtension.lowercased()
+            var original: UInt64?
+            for candidate in candidates where !used.contains(candidate.relative) {
+                guard abs(candidate.modified.timeIntervalSince(entry.modified)) < 2,
+                      (candidate.relative as NSString).pathExtension.lowercased() == kind else { continue }
+                let sourceHash: UInt64 = try original ?? DigiChecksum.hashFile(entry.source, uncached: false, control: control)
+                original = sourceHash
+                var backupHash: UInt64?
+                if let text = recorded[candidate.relative] { backupHash = UInt64(text, radix: 16) }
+                if backupHash == nil {
+                    backupHash = try DigiChecksum.hashFile(root.appendingPathComponent(candidate.relative), uncached: true, control: control)
+                }
+                if backupHash == sourceHash {
+                    used.insert(candidate.relative)
+                    matches.append(RenameMatch(from: candidate.relative, to: entry, checksum: sourceHash))
+                    break
+                }
+            }
+        }
+        return matches
+    }
+
     // MARK: Backup
 
     static func sync(source: URL, destination: URL, archiveChanged: Bool, archiveRemoved: Bool,
@@ -270,8 +322,16 @@ enum DigiStreamEngine {
         var state = SyncProgress(destination: destination.path, status: "Checking new and changed files…")
         state.verifyOn = verify
         state.readBackOn = verify && readBack
-        // v1.26: large files are read back in a separate step, overlapping the next copy.
-        let pipelineReadBack: Bool = verify && readBack
+        // v1.26 read large files back while the next one copied. Measured on the T7
+        // that was no faster (14:30 vs 15:32), so 1.27 copies everything first and
+        // reads it all back in one pass (postVerify). The overlap code stays, off.
+        let pipelineReadBack: Bool = false
+        let postVerify: Bool = verify && readBack
+        var verifying = false
+        let checkedBytes = ByteCounter()
+        var copiedChecks: [(String, UInt64)] = []
+        var archivedCount = 0
+        var renamedPaths: Set<String> = []
         // v1.25: checksums of files verified this run, for the report.
         var verified: [(String, UInt64)] = []
         var removedThisRun: [String] = []
@@ -292,19 +352,27 @@ enum DigiStreamEngine {
         func publish(force: Bool = false) async {
             let now = Date()
             guard force || now.timeIntervalSince(lastUpdate) >= DigiFastBackupEngine.updateInterval else { return }
-            let transferred: Int64 = committedBytes + (copying ? inFlight.value : 0)
-            state.completedBytes = transferred
+            let copiedNow: Int64 = committedBytes + (copying ? inFlight.value : 0)
+            let checkedNow: Int64 = checkedBytes.value
+            state.completedBytes = copiedNow
+            state.verifiedBytes = checkedNow
             state.elapsedSeconds = now.timeIntervalSince(started)
             let activeSeconds: Double = state.elapsedSeconds - state.planSeconds - pausedSeconds
             let transferElapsed: Double = max(0.001, activeSeconds)
-            state.bytesPerSecond = Double(transferred) / transferElapsed
-            if state.bytesPerSecond > 0 {
-                let remaining: Int64 = max(Int64(0), state.totalBytes - transferred)
-                state.eta = Double(remaining) / state.bytesPerSecond
+            // Copy speed stays the copy speed; the read-back pass doesn't change it.
+            if !verifying { state.bytesPerSecond = Double(copiedNow) / transferElapsed }
+            // v1.27: time left covers the read-back pass too (copy + read = the work).
+            let workTotal: Int64 = postVerify ? state.totalBytes * 2 : state.totalBytes
+            let workDone: Int64 = copiedNow + checkedNow
+            let workRate: Double = Double(workDone) / transferElapsed
+            if workRate > 0 {
+                let remaining: Int64 = max(Int64(0), workTotal - workDone)
+                state.eta = Double(remaining) / workRate
             } else {
                 state.eta = nil
             }
-            if copying {
+            let transferred: Int64 = verifying ? checkedNow : copiedNow
+            if copying || verifying {
                 let liveSpan: Double = now.timeIntervalSince(liveStart)
                 if liveSpan >= 3 {
                     state.liveMBps = Double(transferred - liveBytes) / liveSpan / 1_000_000
@@ -321,6 +389,7 @@ enum DigiStreamEngine {
                     if state.speedSamples.count >= DigiFastBackupEngine.maxSpeedSamples {
                         state.speedSamples = DigiFastBackupEngine.foldSamples(state.speedSamples)
                         state.sampleSeconds *= 2
+                        if let start = state.readSampleStart { state.readSampleStart = start / 2 }
                     }
                 }
             }
@@ -379,10 +448,33 @@ enum DigiStreamEngine {
             reportRoot = root
             reportDevice = expectedDevice
 
+            // v1.27: files renamed in the session are renamed on the backup instead of
+            // copied again (only when removed files are archived; otherwise the old
+            // name is meant to stay on the drive).
+            var changes: [BackupEntry] = plan.changes
+            var renames: [RenameMatch] = []
+            if archiveRemoved && !plan.removed.isEmpty && !plan.changes.isEmpty {
+                let listURL = root.appendingPathComponent(DigiFastBackupEngine.reportsName)
+                    .appendingPathComponent(DigiBackupReport.checksumFileName)
+                let recorded = DigiBackupReport.readChecksums(listURL)
+                let pending = plan.changes
+                let gone = plan.removed
+                let renameControl = control
+                state.status = "Looking for renamed files…"
+                await publish(force: true)
+                renames = try await runBlocking {
+                    try findRenames(changes: pending, removed: gone, root: root, recorded: recorded, control: renameControl)
+                }
+                if !renames.isEmpty {
+                    let moved = Set(renames.map { $0.to.relative })
+                    changes = plan.changes.filter { !moved.contains($0.relative) }
+                }
+            }
+
             // Refuse to start if the planned copies cannot fit.
             var neededBytes: Int64 = 0
             var largestReplacement: Int64 = 0
-            for change in plan.changes {
+            for change in changes {
                 let existing = (try? fm.attributesOfItem(atPath: change.destination.path))?[.size] as? NSNumber
                 if !archiveChanged, let existing {
                     neededBytes += max(Int64(0), change.size - existing.int64Value)
@@ -402,11 +494,26 @@ enum DigiStreamEngine {
                 try await control.checkpoint()
                 try ensureDirectory(directory, under: root, device: expectedDevice)
             }
+            // v1.27: carry out the renames (the folders exist now).
+            for match in renames {
+                try await control.checkpoint()
+                let old = root.appendingPathComponent(match.from)
+                try checkDirectory(old.deletingLastPathComponent(), device: expectedDevice)
+                try checkDirectory(match.to.destination.deletingLastPathComponent(), device: expectedDevice)
+                guard !fm.fileExists(atPath: match.to.destination.path) else {
+                    throw failure("A file appeared where a renamed file was going: " + match.to.relative + ". Run the backup again.")
+                }
+                try fm.moveItem(at: old, to: match.to.destination)
+                verified.append((match.to.relative, match.checksum))
+                removedThisRun.append(match.from)
+                renamedPaths.insert(match.to.relative)
+                state.renamedFiles += 1
+            }
             state.planSeconds = Date().timeIntervalSince(planStarted)
-            state.totalFiles = plan.changes.count
-            state.totalBytes = plan.changes.reduce(Int64(0)) { $0 + $1.size }
+            state.totalFiles = changes.count
+            state.totalBytes = changes.reduce(Int64(0)) { $0 + $1.size }
             state.unchangedFiles = plan.unchanged
-            state.status = plan.changes.isEmpty ? "No new or changed files" : "Copying new and changed files"
+            state.status = changes.isEmpty ? "No new or changed files" : "Copying new and changed files"
             await publish(force: true)
 
             let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + "-" + String(UUID().uuidString.prefix(8))
@@ -417,8 +524,8 @@ enum DigiStreamEngine {
             current.files = current.files.filter { !filter.includes($0.key) || keys.contains($0.key) }
             for relative in keys { current.files[relative] = "size-date-match" }
 
-            let large: [BackupEntry] = plan.changes.filter { $0.size >= largeFileThreshold }
-            let small: [BackupEntry] = plan.changes.filter { $0.size < largeFileThreshold }
+            let large: [BackupEntry] = changes.filter { $0.size >= largeFileThreshold }
+            let small: [BackupEntry] = changes.filter { $0.size < largeFileThreshold }
 
             func commit(_ staged: Staged) throws {
                 let entry = staged.entry
@@ -440,6 +547,7 @@ enum DigiStreamEngine {
                         try ensureDirectory(parent, under: root, device: expectedDevice)
                         let archived = root.appendingPathComponent(relative)
                         try fm.moveItem(at: entry.destination, to: archived)
+                        archivedCount += 1
                         do {
                             try fm.moveItem(at: temporary, to: entry.destination)
                         } catch {
@@ -459,7 +567,10 @@ enum DigiStreamEngine {
                 current.files[entry.relative] = "copied-size-date"
                 if let checksum = staged.checksum {
                     verified.append((entry.relative, checksum))
-                    state.verifiedFiles += 1
+                    copiedChecks.append((entry.relative, checksum))
+                    state.checksummedFiles += 1
+                    // Copies checked as they were written (overlap path) count as verified.
+                    if staged.needsReadBack || (readBack && !postVerify) { state.verifiedFiles += 1 }
                 }
                 state.completedFiles += 1
                 committedBytes += entry.size
@@ -475,7 +586,7 @@ enum DigiStreamEngine {
             copyStarted = Date()
             liveStart = copyStarted; liveBytes = 0
             sampleStart = copyStarted; sampleBytes = 0
-            copying = !plan.changes.isEmpty
+            copying = !changes.isEmpty
 
             if copying {
                 try await withThrowingTaskGroup(of: LaneResult.self) { group in
@@ -509,8 +620,9 @@ enum DigiStreamEngine {
                                                              control: laneControl, written: counter, verify: verify,
                                                              readBack: false)
                                     }
+                                    // v1.27: Full verify reads small files back in the pass after copying too.
                                     let value = try copySmall(source: entry.source, target: temporary, verify: verify,
-                                                              readBack: readBack, control: laneControl)
+                                                              readBack: false, control: laneControl)
                                     counter.add(entry.size)
                                     return value
                                 }
@@ -635,6 +747,72 @@ enum DigiStreamEngine {
             }
             copying = false
 
+            // v1.27: Full verify. Everything is on the drive; now read every new copy
+            // back and compare with the original's checksum. A copy that doesn't match
+            // is copied again from the original (checked as it's written).
+            func repair(_ entry: BackupEntry, expected: UInt64) async throws {
+                try checkSourceUnchanged(entry)
+                let temporary = entry.destination.deletingLastPathComponent()
+                    .appendingPathComponent(".shootwrap-" + UUID().uuidString + ".tmp")
+                temporaries.insert(temporary)
+                let repairControl = abort
+                let scratch = ByteCounter()
+                let fresh: UInt64? = try await runBlocking { () throws -> UInt64? in
+                    if entry.size >= largeFileThreshold {
+                        return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
+                                             control: repairControl, written: scratch, verify: true, readBack: true)
+                    }
+                    return try copySmall(source: entry.source, target: temporary, verify: true, readBack: true, control: repairControl)
+                }
+                guard fresh == expected else { throw ChecksumMismatch(relative: entry.relative) }
+                try checkSourceUnchanged(entry)
+                try checkDirectory(entry.destination.deletingLastPathComponent(), device: expectedDevice)
+                try fm.setAttributes([.modificationDate: entry.modified], ofItemAtPath: temporary.path)
+                _ = try fm.replaceItemAt(entry.destination, withItemAt: temporary,
+                                         backupItemName: nil, options: .usingNewMetadataOnly)
+                temporaries.remove(temporary)
+                state.repairedFiles += 1
+            }
+            if postVerify && !copiedChecks.isEmpty {
+                verifying = true
+                state.verifyPhase = true
+                state.readSampleStart = state.speedSamples.count
+                let phaseStart = Date()
+                liveStart = phaseStart; liveBytes = 0
+                sampleStart = phaseStart; sampleBytes = 0
+                var byRelative: [String: BackupEntry] = [:]
+                for entry in changes { byRelative[entry.relative] = entry }
+                let total: Int = copiedChecks.count
+                for (index, item) in copiedChecks.enumerated() {
+                    try await pauseIfNeeded()
+                    let relative: String = item.0
+                    let expected: UInt64 = item.1
+                    let target = root.appendingPathComponent(relative)
+                    state.status = "Verifying \(index + 1) of \(total): " + relative
+                    await publish()
+                    let readControl = abort
+                    let readGate = gate
+                    let counter = checkedBytes
+                    var matched: Bool = try await runBlocking { () throws -> Bool in
+                        func readOnce() throws -> Bool {
+                            let copied = try DigiChecksum.hashFile(target, uncached: true, control: readControl, counted: counter)
+                            return copied == expected
+                        }
+                        if let readGate { return try readGate.withPolicy { try readOnce() } }
+                        return try readOnce()
+                    }
+                    if !matched, let entry = byRelative[relative] {
+                        try await repair(entry, expected: expected)
+                        matched = true
+                    }
+                    guard matched else { throw ChecksumMismatch(relative: relative) }
+                    state.verifiedFiles += 1
+                }
+                verifying = false
+                state.status = "Finishing…"
+                await publish(force: true)
+            }
+
             try await control.checkpoint()
             let finishStarted = Date()
             if archiveRemoved {
@@ -651,6 +829,7 @@ enum DigiStreamEngine {
                     try ensureDirectory((target as NSString).deletingLastPathComponent, under: root, device: expectedDevice)
                     try fm.moveItem(at: old, to: root.appendingPathComponent(target))
                     removedThisRun.append(relative)
+                    archivedCount += 1
                 }
             }
             try await control.checkpoint()
@@ -675,7 +854,9 @@ enum DigiStreamEngine {
                 source: source, destination: root, device: device, started: started, finished: Date(),
                 status: state.status, verified: verified, removed: removedThisRun,
                 unchangedFiles: state.unchangedFiles, sourceKeys: reportKeys,
-                copiedBytes: committedBytes, readBack: readBack)
+                copiedBytes: committedBytes, readBack: readBack,
+                readBackDone: postVerify ? state.verifiedFiles : 0, renamedPaths: renamedPaths,
+                archived: archivedCount, repaired: state.repairedFiles)
             do {
                 state.reportPath = try DigiBackupReport.write(input)
             } catch {

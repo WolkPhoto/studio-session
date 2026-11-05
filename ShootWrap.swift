@@ -2812,7 +2812,16 @@ struct ShootWrapView: View {
                 Spacer(minLength: 4)
             }
             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            DigiSpeedSparkline(samples: item.speedSamples, peak: item.peakMBps, height: 70)
+            DigiSpeedSparkline(samples: item.speedSamples, peak: item.peakMBps, height: 70,
+                               readStart: item.readSampleStart, sampleSeconds: item.sampleSeconds)
+            if item.readSampleStart != nil {
+                HStack(spacing: 12) {
+                    Label("Copying", systemImage: "circle.fill").foregroundStyle(DigiBrand.accent)
+                    Label("Reading back to verify", systemImage: "circle.fill").foregroundStyle(Color(red: 0.36, green: 0.72, blue: 0.95))
+                    Spacer(minLength: 0)
+                }
+                .font(.caption2).labelStyle(.titleAndIcon).imageScale(.small)
+            }
             HStack(spacing: 8) {
                 Text(bytes(item.completedBytes) + " of " + bytes(item.totalBytes))
                 Spacer(minLength: 4)
@@ -2835,6 +2844,9 @@ struct ShootWrapView: View {
         parts.append(bytes(done) + " of " + bytes(total))
         parts.append("\(files) of \(totalFiles) files")
         parts.append(String(format: "Avg %.0f MB/s", averageBytes / 1_000_000))
+        if model.syncBusy && model.syncProgress.contains(where: { $0.verifyPhase && $0.status.hasPrefix("Verifying") }) {
+            parts.append("verifying copies")
+        }
         if model.syncBusy {
             parts.append(String(format: "Now %.0f MB/s", live))
             parts.append("ETA " + overallBackupETA)
@@ -2864,7 +2876,7 @@ struct ShootWrapView: View {
     private var verifyModeMenu: some View {
         Menu {
             Picker("Checksums", selection: $model.verifyMode) {
-                Text("Full verify: read every copy back (safest)").tag("full")
+                Text("Full verify: copy, then read every copy back (safest)").tag("full")
                 Text("Quick: checksum originals, don't read copies back").tag("quick")
                 Text("Off: size and date only").tag("off")
             }
@@ -2879,30 +2891,14 @@ struct ShootWrapView: View {
         .help("How each copy is checked. Change it before a backup starts.")
     }
 
-    private var verifyModePicker: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Picker("Checksums", selection: $model.verifyMode) {
-                Text("Full verify").tag("full")
-                Text("Quick").tag("quick")
-                Text("Off").tag("off")
-            }
-            .pickerStyle(.segmented)
-            .fixedSize()
-            .disabled(model.syncBusy)
-            Text(verifyModeExplanation)
-                .font(.caption2).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
     private var verifyModeExplanation: String {
         switch model.verifyMode {
         case "quick":
-            return "Each original gets an xxHash64 checksum while it copies, about as fast as no checksums. Copies aren't read back, so a bad write wouldn't be caught. Report and checksum list go in " + DigiFastBackupEngine.reportsName + " on each drive."
+            return "Quick: each original gets an xxHash64 checksum while it copies, about as fast as no checksums. Copies aren't read back, so a bad write wouldn't be caught. Report and checksum list go in " + DigiFastBackupEngine.reportsName + " on each drive."
         case "off":
-            return "Files are matched by size and date only. No report or checksum list. Use Check > Deep Verify for a content check."
+            return "Checksums off: files are matched by size and date only. No report or checksum list. Use Check > Deep Verify for a content check."
         default:
-            return "Each copy is read back from the drive and its xxHash64 checksum compared with the original before it's kept. Slower, the safest. Report and checksum list go in " + DigiFastBackupEngine.reportsName + " on each drive."
+            return "Full verify: copies everything first, then reads every copy back from the drive and compares its xxHash64 checksum with the original. A copy that doesn't match is copied again. The safest; takes longer. Report and checksum list go in " + DigiFastBackupEngine.reportsName + " on each drive."
         }
     }
 
@@ -2917,8 +2913,9 @@ struct ShootWrapView: View {
     }
 
     private var backupOverallFraction: Double {
-        let total: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + $1.totalBytes }
-        let done: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + $1.completedBytes }
+        // v1.27: Full verify counts copying and reading back.
+        let total: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + ($1.readBackOn ? $1.totalBytes * 2 : $1.totalBytes) }
+        let done: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + $1.completedBytes + $1.verifiedBytes }
         guard total > 0 else { return 0 }
         return min(1, Double(done) / Double(total))
     }
@@ -2936,12 +2933,18 @@ struct ShootWrapView: View {
                     HStack(spacing: 10) {
                         backupActionButtons
                         Spacer(minLength: 0)
+                        verifyModeMenu
                     }
                     backupSummaryLine
                 }
             }
             if model.syncBusy && !model.syncProgress.isEmpty {
                 ProgressView(value: backupOverallFraction).controlSize(.small)
+            } else {
+                // v1.27: what the checksum choice will do, right by Start Backup.
+                Text(verifyModeExplanation)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
@@ -3118,7 +3121,28 @@ struct ShootWrapView: View {
         }
     }
 
+    /// v1.27: "1,204 copied · 980 verified · 12 renamed · 36,513 unchanged".
+    private func copyCountText(_ progress: SyncProgress) -> String {
+        var parts: [String] = []
+        if progress.readBackOn {
+            parts.append("\(progress.completedFiles.formatted()) copied")
+            parts.append("\(progress.verifiedFiles.formatted()) verified")
+        } else {
+            parts.append("\(progress.completedFiles.formatted()) copied, checksummed")
+        }
+        if progress.renamedFiles > 0 { parts.append("\(progress.renamedFiles.formatted()) renamed") }
+        if progress.repairedFiles > 0 { parts.append("\(progress.repairedFiles.formatted()) re-copied") }
+        parts.append("\(progress.unchangedFiles.formatted()) unchanged")
+        return parts.joined(separator: " · ")
+    }
+
     private func progressFraction(_ item: SyncProgress) -> Double {
+        if item.status == DigiFastBackupEngine.completeStatus { return 1 }
+        // v1.27: with Full verify the bar covers copying and reading back (half each).
+        if item.readBackOn && item.totalBytes > 0 {
+            let done: Double = Double(item.completedBytes + item.verifiedBytes)
+            return min(1, done / Double(item.totalBytes * 2))
+        }
         if item.totalBytes > 0 { return min(1, Double(item.completedBytes) / Double(item.totalBytes)) }
         return item.status == DigiFastBackupEngine.completeStatus ? 1 : 0
     }
@@ -3145,9 +3169,8 @@ struct ShootWrapView: View {
         destinationSpeedDetail(progress)
         HStack {
             if progress.verifyOn {
-                let word: String = progress.readBackOn ? "verified" : "checksummed"
-                Label("\(progress.verifiedFiles) of \(progress.completedFiles) copied " + word + " · \(progress.unchangedFiles) unchanged", systemImage: "checkmark.seal")
-                    .help(progress.readBackOn ? "Each copy is read back from the drive and its xxHash64 checksum compared with the original." : "Quick: each original's xxHash64 checksum was recorded while it copied. Copies weren't read back.")
+                Label(copyCountText(progress), systemImage: "checkmark.seal")
+                    .help(progress.readBackOn ? "Full verify: everything is copied first, then every copy is read back from the drive and its xxHash64 checksum compared with the original." : "Quick: each original's xxHash64 checksum was recorded while it copied. Copies weren't read back.")
             } else {
                 Text("\(progress.completedFiles) copied · \(progress.unchangedFiles) unchanged")
             }
@@ -3419,7 +3442,7 @@ struct ShootWrapView: View {
                                 .font(.caption2).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                             Divider()
-                            verifyModePicker
+                            // v1.27: the checksum choice lives on the backup bar (Checksums ▾), next to Start Backup.
                             Toggle("Go easy on the disk while Capture One is open", isOn: $model.gentleWhileCapture).disabled(model.syncBusy)
                             Text("Backups give Capture One first turn at the disk so captures keep landing fast. Backups may run slower while Capture One is open.")
                                 .font(.caption2).foregroundStyle(.secondary)
@@ -4596,6 +4619,13 @@ struct DigiSpeedSparkline: View {
     let samples: [Double]
     let peak: Double
     var height: CGFloat = 40
+    /// v1.27: where the read-back pass starts; drawn in a second color.
+    var readStart: Int? = nil
+    /// Seconds each sample covers, for the hover readout.
+    var sampleSeconds: Double = 1
+    @State private var hoverX: CGFloat?
+
+    private static let readColor = Color(red: 0.36, green: 0.72, blue: 0.95)
 
     private func points(in size: CGSize) -> [CGPoint] {
         guard samples.count > 1 else { return [] }
@@ -4630,6 +4660,67 @@ struct DigiSpeedSparkline: View {
         return path
     }
 
+    /// "2:14 in · 582 MB/s · 78 GB copied" (or "read-back … checked").
+    private func readout(at index: Int) -> String {
+        let seconds: Int = Int((Double(index + 1) * sampleSeconds).rounded())
+        let time: String = String(format: "%d:%02d", seconds / 60, seconds % 60)
+        var reading = false
+        var first = 0
+        if let readStart, index >= readStart {
+            reading = true
+            first = readStart
+        }
+        var megabytes: Double = 0
+        if first <= index {
+            for position in first...index { megabytes += samples[position] * sampleSeconds }
+        }
+        let amount: String = ByteCountFormatter.string(fromByteCount: Int64(megabytes * 1_000_000), countStyle: .file)
+        let speed: String = String(format: "%.0f MB/s", samples[index])
+        let kind: String = reading ? "read-back " : ""
+        let done: String = reading ? " checked" : " copied"
+        return time + " in · " + kind + speed + " · " + amount + done
+    }
+
+    @ViewBuilder private func graph(_ plotted: [CGPoint], height: CGFloat) -> some View {
+        let split: Int? = readStart.flatMap { $0 > 0 && $0 < plotted.count ? $0 : nil }
+        let writePoints: [CGPoint] = split.map { Array(plotted[0...$0]) } ?? plotted
+        let readPoints: [CGPoint] = split.map { Array(plotted[$0...]) } ?? []
+        area(writePoints, height: height)
+            .fill(LinearGradient(colors: [DigiBrand.accent.opacity(0.35), DigiBrand.accent.opacity(0.04)],
+                                 startPoint: .top, endPoint: .bottom))
+        line(writePoints)
+            .stroke(DigiBrand.accent, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        if !readPoints.isEmpty {
+            area(readPoints, height: height)
+                .fill(LinearGradient(colors: [Self.readColor.opacity(0.30), Self.readColor.opacity(0.04)],
+                                     startPoint: .top, endPoint: .bottom))
+            line(readPoints)
+                .stroke(Self.readColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        }
+    }
+
+    @ViewBuilder private func hoverMark(_ plotted: [CGPoint], size: CGSize) -> some View {
+        if let hoverX, plotted.count > 1 {
+            let step: CGFloat = size.width / CGFloat(plotted.count - 1)
+            let raw: Int = Int((hoverX / max(step, 0.001)).rounded())
+            let index: Int = min(plotted.count - 1, max(0, raw))
+            let point: CGPoint = plotted[index]
+            let label: String = readout(at: index)
+            Path { path in
+                path.move(to: CGPoint(x: point.x, y: 0))
+                path.addLine(to: CGPoint(x: point.x, y: size.height))
+            }
+            .stroke(Color.primary.opacity(0.35), lineWidth: 1)
+            Circle().fill(Color.primary).frame(width: 6, height: 6).position(point)
+            Text(label)
+                .font(.caption2.monospacedDigit())
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
+                .fixedSize()
+                .position(x: min(max(point.x, 110), max(110, size.width - 110)), y: 12)
+        }
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let plotted = points(in: geometry.size)
@@ -4639,11 +4730,16 @@ struct DigiSpeedSparkline: View {
                     Text("Speed graph appears once copying starts")
                         .font(.caption2).foregroundStyle(.tertiary)
                 } else {
-                    area(plotted, height: geometry.size.height)
-                        .fill(LinearGradient(colors: [DigiBrand.accent.opacity(0.35), DigiBrand.accent.opacity(0.04)],
-                                             startPoint: .top, endPoint: .bottom))
-                    line(plotted)
-                        .stroke(DigiBrand.accent, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                    graph(plotted, height: geometry.size.height)
+                    hoverMark(plotted, size: geometry.size)
+                }
+            }
+            .contentShape(Rectangle())
+            // v1.27: hover anywhere on the graph to read the speed at that moment.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location): hoverX = location.x
+                case .ended: hoverX = nil
                 }
             }
         }

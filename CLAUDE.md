@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.26.0 (folder `DigiFour_1_26`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.27.0 (folder `DigiFour_1_27`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -372,3 +372,32 @@ the lineup and build commands. 1.0 compiled clean on the first try (Nov 2, 7:28)
 - Eject of a drive that's already gone: "<name> is already unplugged. Nothing to eject."
 - Connected-drive folder suggestions use the backup source's name (syncSource ?? root), not the
   Home session (Jeff saw "testing" while backing up 2026_10_14_LIG_GO); refreshed when the source changes.
+
+### 1.26 test results (Nov 5, T7 freshly erased APFS before the Full run, fans on, Capture One closed)
+| Mode | Time |
+|---|---|
+| Full verify (overlapped read-back), fresh erase | 14:30 (avg 294 MB/s write; dip to ~100 MB/s at ~215 GB, recovered) |
+| Quick, after 10 min idle, new folder | 7:04 (601 MB/s, flat) |
+| Nov 1, no checksums, fresh erase | 6:30 |
+- Reading back on the same USB drive while writing halves write speed and keeps the T7's fast cache
+  from draining. Overlap gained ~1 min only. Sustained writes after repeated delete/rewrite fell to
+  30-100 MB/s (drive state / heat), so speed tests need a rested, cool drive.
+- Rename test: 38 images renamed in Capture One -> 188 files (2.5 GB) recopied in 8 s, 2.5 GB archived.
+
+### 1.27
+- Full verify = copy everything first (Quick speed), then one read-back pass over every new copy
+  (postVerify, copiedChecks). Mismatch -> repair(): fresh copy from the original, checked as written
+  (copyLarge/copySmall readBack: true), replaceItemAt, SyncProgress.repairedFiles; second failure ->
+  ChecksumMismatch. The 1.26 overlap path is off (pipelineReadBack = false), code kept.
+  Progress/ETA cover copy + read (bar = (copied + verifiedBytes) / 2 x total); copy MB/s unchanged
+  during the pass. Graph: read-back samples from SyncProgress.readSampleStart drawn in blue, legend.
+- Rename detection (findRenames, only with "Archive tracked files removed" on): a new file whose size,
+  date and extension match a file that left the session, with equal contents (original's xxHash64 vs
+  the backup copy's recorded checksum, or the backup copy hashed when none recorded), is moved on the
+  backup instead of copied + archived. SyncProgress.renamedFiles; checksum list follows the rename.
+- Graph hover (onContinuousHover): line + "2:14 in · 582 MB/s · 78 GB copied" / read-back variant.
+- Checksum choice only on the backup bar (Checksums ▾) with its explanation under the bar when idle;
+  removed from the schedule options. Counts line: "N copied · N verified · N renamed · N unchanged"
+  (Quick: "N copied, checksummed"); SyncProgress.checksummedFiles.
+- Report: "Copied this run (read back and verified | checksummed)", renamed, re-copied and archived
+  counts, "1 file" plurals, method text for verify-after-copy, stopped-during-verify note.
