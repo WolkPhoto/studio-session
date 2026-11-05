@@ -1,0 +1,1 @@
+Tab drag fix: drag a tab onto another tab to reorder. Command-drag also works, but Command is no longer required. Normal click still selects a tab. This change removes a modifier-state check that could prevent drag sessions from starting. Built source has not been compiled on macOS in this environment.

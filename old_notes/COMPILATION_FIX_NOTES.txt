@@ -1,0 +1,1 @@
+Fixes Swift concurrency compile errors in FolderCompare.swift by capturing an immutable completedScans value in the MainActor closure. No backup engine changes. Requires macOS compilation for validation.

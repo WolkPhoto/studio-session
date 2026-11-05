@@ -1,0 +1,1 @@
+Backup Sync now inventories and creates all included source directories on each destination, including empty folders such as Selects. Runs on incremental syncs with no changed files. Honors backup exclusions, avoids archive directories and symlink traversal, and fails visibly if a destination file blocks a directory. Folder Compare and all other app files are unchanged.

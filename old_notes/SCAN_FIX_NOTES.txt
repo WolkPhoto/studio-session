@@ -1,0 +1,1 @@
+Folder Compare: explicit recursive directory traversal, scan warnings, source Capture scan totals, per-Capture-subfolder diagnostic export. Other app source files preserved from Full Scan baseline.

@@ -1,0 +1,10 @@
+Capture One multi-session chooser
+- Enumerates every open Capture One document through AppleScript.
+- Uses Spotlight exact-name lookup for each .cosessiondb; validates each file exists.
+- Shows all verified open session folders in a radio selection dialog.
+- Preselects the current Capture One document when the folder name matches.
+- Supports same-name session copies by displaying full paths.
+- Monitors every ~12 seconds; prompts when the set of detected session paths changes.
+- No automatic backup; requires confirmation before changing workspace.
+- If a drive is not indexed by Spotlight, use Open Session manually.
+- macOS compilation/runtime not available in this environment. Please test on Mac.

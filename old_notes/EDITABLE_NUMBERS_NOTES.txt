@@ -1,0 +1,1 @@
+Folder Maker sequence Start, End, Digits and Step accept direct numeric entry and retain arrow steppers. Values are clamped to the existing valid ranges. No changes to the folder generation engine or other tabs. macOS build not tested.\n

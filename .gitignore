@@ -1,0 +1,8 @@
+# Build output
+*.app
+*.dmg
+*.zip
+build_log.txt
+release_log.txt
+.DS_Store
+.build/

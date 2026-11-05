@@ -1,0 +1,1 @@
+Cmd+Q prompts when a backup is running or paused. Keep Backing Up cancels termination; Quit Anyway exits. The build no longer sends a quit command to an already running Digi Suite instance.

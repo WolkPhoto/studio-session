@@ -1,0 +1,1 @@
+Added per-logo image thumbnails to Logos & Branding. PNG/JPEG/PDF rendered through NSImage. Other existing features unchanged. Requires compilation on macOS.

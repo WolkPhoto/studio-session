@@ -1,0 +1,10 @@
+Capture One session detection update
+- Reads the current document's .cosessiondb filename using AppleScript.
+- Searches Spotlight by exact filename (works on indexed internal/external drives).
+- Verifies each result exists; offers a location picker if duplicate names are found.
+- Remembers confirmed locations for future fallback when indexing is unavailable.
+- Preserves existing backup destinations; asks before switching; no automatic backup.
+- Auto-detect checks approximately every 12 seconds, with manual Detect Session retry.
+- Non-indexed network/external volumes still require Open Session manual selection.
+- Requires Capture One Automation access when macOS requests it.
+- Source ZIP is packaged but cannot be compiled on this Linux environment.

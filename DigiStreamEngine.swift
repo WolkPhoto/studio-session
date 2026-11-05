@@ -1,0 +1,643 @@
+import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
+
+// Digi Stream copy engine (version 17).
+//
+// Written fresh for Digi Suite. It replaces how file contents are copied and
+// scheduled. Planning, the manifest file and the archive layout are shared
+// with the classic engine, so a destination can switch engines and stay
+// incremental.
+//
+// How it copies:
+// - Large files (8 MiB and up, mostly RAW) go one at a time. Each is read in
+//   16 MiB chunks and written with the macOS write cache bypassed (F_NOCACHE),
+//   into space reserved up front (F_PREALLOCATE). The goal is a steady stream
+//   to the drive instead of the cache filling and then flushing in bursts.
+// - Small files (Capture One settings, previews, databases) go four at a time
+//   through macOS copyfile, alongside the large-file stream, so thousands of
+//   tiny files never hold up the RAW copies.
+// - Every file is written to a temporary name, checked, then moved into place,
+//   exactly like the classic engine. Stop and Pause also work in the middle of
+//   a large file.
+// - Progress counts bytes as they are written, so the speed graph is accurate
+//   even for very large files.
+enum DigiStreamEngine {
+    static let displayName = "Digi Stream"
+    static let largeFileThreshold: Int64 = 8 * 1024 * 1024
+    static let chunkSize = 16 * 1024 * 1024
+    static let smallLaneWidth = 4
+
+    // MARK: Small helpers
+
+    final class ByteCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var total: Int64 = 0
+        func add(_ amount: Int64) { lock.lock(); total += amount; lock.unlock() }
+        var value: Int64 { lock.lock(); defer { lock.unlock() }; return total }
+    }
+
+    enum Lane: Sendable { case large, small }
+
+    struct Staged: Sendable {
+        let entry: BackupEntry
+        let temporary: URL
+        let lane: Lane
+        let seconds: Double
+        /// v1.25: xxHash64 of the source, already compared with the copy read back.
+        var checksum: UInt64? = nil
+    }
+
+    /// v1.25: the copy read back from the drive didn't match the source.
+    struct ChecksumMismatch: Error, LocalizedError {
+        let relative: String
+        var errorDescription: String? {
+            "Checksum mismatch: the copy of " + relative + " didn't match the original, even after copying it again. The bad copy was discarded. Check the drive and cable, then run the backup again."
+        }
+    }
+
+    enum LaneResult: Sendable {
+        case staged(Staged)
+        case tick
+    }
+
+    static func failure(_ message: String) -> NSError {
+        NSError(domain: "DigiSuiteStream", code: 17, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    static func posixFailure(_ action: String, _ path: String) -> NSError {
+        let code: Int32 = errno
+        let reason = String(cString: strerror(code))
+        return failure(action + " " + path + ": " + reason)
+    }
+
+    /// Runs blocking file work on a GCD thread so Swift's cooperative thread
+    /// pool is never tied up by disk writes.
+    static func runBlocking<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let value = try work()
+                    continuation.resume(returning: value)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Blocks while paused; throws when stopped. Safe to call off the main thread.
+    static func waitIfPaused(_ control: BackupControl) throws {
+        while control.isPaused && !control.isStopped {
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        if control.isStopped { throw CancellationError() }
+    }
+
+    // MARK: Copy primitives
+
+    /// Reserves the whole file's space before writing. Contiguous first; if the
+    /// drive cannot give one piece, any space. Failure is harmless.
+    static func preallocate(_ descriptor: Int32, size: Int64) {
+        #if canImport(Darwin)
+        let contiguous: UInt32 = UInt32(F_ALLOCATECONTIG) | UInt32(F_ALLOCATEALL)
+        var store = fstore_t(fst_flags: contiguous, fst_posmode: F_PEOFPOSMODE,
+                             fst_offset: 0, fst_length: off_t(size), fst_bytesalloc: 0)
+        if fcntl(descriptor, F_PREALLOCATE, &store) == -1 {
+            store.fst_flags = UInt32(F_ALLOCATEALL)
+            _ = fcntl(descriptor, F_PREALLOCATE, &store)
+        }
+        #endif
+    }
+
+    /// Copies Finder info, extended attributes, ACLs, permissions, flags and
+    /// dates from source to target, without touching the file contents.
+    static func copyMetadata(source: URL, target: URL) throws {
+        #if canImport(Darwin)
+        let flags = copyfile_flags_t(COPYFILE_ACL | COPYFILE_STAT | COPYFILE_XATTR)
+        if copyfile(source.path, target.path, nil, flags) != 0 {
+            throw posixFailure("Could not copy file information to", target.path)
+        }
+        #endif
+    }
+
+    /// Large-file copy: 16 MiB chunks, write cache bypassed, space preallocated.
+    /// Checks Pause and Stop between chunks.
+    @discardableResult
+    static func copyLarge(source: URL, target: URL, expectedSize: Int64,
+                          control: BackupControl, written: ByteCounter, verify: Bool = false) throws -> UInt64? {
+        let input = open(source.path, O_RDONLY)
+        guard input >= 0 else { throw posixFailure("Could not open", source.path) }
+        defer { close(input) }
+        let output = open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+        guard output >= 0 else { throw posixFailure("Could not create", target.path) }
+        var outputOpen = true
+        defer { if outputOpen { close(output) } }
+        #if canImport(Darwin)
+        _ = fcntl(input, F_RDAHEAD, 1)
+        _ = fcntl(output, F_NOCACHE, 1)
+        #endif
+        if expectedSize > 0 { preallocate(output, size: expectedSize) }
+
+        var allocated: UnsafeMutableRawPointer?
+        guard posix_memalign(&allocated, 16_384, chunkSize) == 0, let buffer = allocated else {
+            throw failure("Could not allocate a copy buffer")
+        }
+        defer { free(buffer) }
+
+        var total: Int64 = 0
+        var hasher = XXHash64()
+        while true {
+            try waitIfPaused(control)
+            let count: Int = read(input, buffer, chunkSize)
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw posixFailure("Could not read", source.path)
+            }
+            if count == 0 { break }
+            // v1.25: the source is hashed from the same bytes that get written.
+            if verify { hasher.update(UnsafeRawPointer(buffer), count: count) }
+            var offset = 0
+            while offset < count {
+                let wrote: Int = write(output, buffer + offset, count - offset)
+                if wrote < 0 {
+                    if errno == EINTR { continue }
+                    throw posixFailure("Could not write", target.path)
+                }
+                offset += wrote
+            }
+            total += Int64(count)
+            written.add(Int64(count))
+        }
+        guard total == expectedSize else {
+            throw failure("Source size changed while copying: " + source.path)
+        }
+        outputOpen = false
+        if close(output) != 0 { throw posixFailure("Could not finish writing", target.path) }
+        try copyMetadata(source: source, target: target)
+        guard verify else { return nil }
+        let expected = hasher.finish()
+        // Read the new copy back from the drive and compare.
+        let copied = try DigiChecksum.hashFile(target, uncached: true, control: control)
+        guard copied == expected else { throw ChecksumMismatch(relative: source.lastPathComponent) }
+        return expected
+    }
+
+    /// Small-file copy through macOS copyfile (contents and all file information).
+    @discardableResult
+    static func copySmall(source: URL, target: URL, verify: Bool = false, control: BackupControl? = nil) throws -> UInt64? {
+        #if canImport(Darwin)
+        let flags = copyfile_flags_t(COPYFILE_ACL | COPYFILE_STAT | COPYFILE_XATTR | COPYFILE_DATA | COPYFILE_EXCL)
+        if copyfile(source.path, target.path, nil, flags) != 0 {
+            throw posixFailure("Could not copy", source.path)
+        }
+        #else
+        try FileManager().copyItem(at: source, to: target)
+        #endif
+        guard verify else { return nil }
+        let expected = try DigiChecksum.hashFile(source, uncached: false, control: control)
+        let copied = try DigiChecksum.hashFile(target, uncached: true, control: control)
+        guard copied == expected else { throw ChecksumMismatch(relative: source.lastPathComponent) }
+        return expected
+    }
+
+    // MARK: Destination safety (same rules as the classic engine)
+
+    static func deviceNumber(_ folder: URL) throws -> NSNumber {
+        guard let number = try FileManager.default.attributesOfItem(atPath: folder.path)[.systemNumber] as? NSNumber else {
+            throw failure("Cannot inspect destination filesystem: " + folder.path)
+        }
+        return number
+    }
+
+    static func checkDirectory(_ folder: URL, device expected: NSNumber) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: folder.path)
+        let isDirectory = attributes[.type] as? FileAttributeType == .typeDirectory
+        let sameDevice = (attributes[.systemNumber] as? NSNumber) == expected
+        guard isDirectory && sameDevice else {
+            throw failure("Destination directory changed, is a symbolic link, or is Unavailable: " + folder.path)
+        }
+    }
+
+    /// Creates each missing folder one level at a time and never recreates the
+    /// destination root or a missing /Volumes mount.
+    static func ensureDirectory(_ relative: String, under root: URL, device expected: NSNumber) throws {
+        try DigiFastBackupEngine.validateRelative(relative)
+        var parent = root
+        for component in relative.split(separator: "/") {
+            try checkDirectory(parent, device: expected)
+            let next = parent.appendingPathComponent(String(component), isDirectory: true)
+            if !FileManager.default.fileExists(atPath: next.path) {
+                try FileManager.default.createDirectory(at: next, withIntermediateDirectories: false)
+            }
+            try checkDirectory(next, device: expected)
+            parent = next
+        }
+    }
+
+    static func checkSourceUnchanged(_ entry: BackupEntry) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: entry.source.path)
+        let isFile = attributes[.type] as? FileAttributeType == .typeRegular
+        let sameSize = (attributes[.size] as? NSNumber)?.int64Value == entry.size
+        let sameDate = attributes[.modificationDate] as? Date == entry.modified
+        guard isFile && sameSize && sameDate else {
+            throw failure("Source changed during backup: " + entry.relative + ". Run the next incremental backup after it finishes writing.")
+        }
+    }
+
+    // MARK: Backup
+
+    static func sync(source: URL, destination: URL, archiveChanged: Bool, archiveRemoved: Bool,
+                     filter: BackupFilter, snapshot supplied: DigiSyncSourceSnapshot? = nil,
+                     control: BackupControl,
+                     verify: Bool = false,
+                     gate: DigiCaptureGate? = nil,
+                     availableSpace: @escaping @Sendable (URL) -> Int64? = { DigiFastBackupEngine.availableBytes($0) },
+                     report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
+        let fm = FileManager.default
+        let started = Date()
+        var state = SyncProgress(destination: destination.path, status: "Checking new and changed files…")
+        state.verifyOn = verify
+        // v1.25: checksums of files verified this run, for the report.
+        var verified: [(String, UInt64)] = []
+        var removedThisRun: [String] = []
+        var reportRoot: URL?
+        var reportDevice: NSNumber?
+        var reportKeys: Set<String> = []
+        let inFlight = ByteCounter()
+        var committedBytes: Int64 = 0
+        var lastUpdate = Date.distantPast
+        var liveStart = Date()
+        var liveBytes: Int64 = 0
+        var sampleStart = Date()
+        var sampleBytes: Int64 = 0
+        var copying = false
+        // Version 18.3: time spent paused is left out of average speed and ETA.
+        var pausedSeconds: Double = 0
+
+        func publish(force: Bool = false) async {
+            let now = Date()
+            guard force || now.timeIntervalSince(lastUpdate) >= DigiFastBackupEngine.updateInterval else { return }
+            let transferred: Int64 = committedBytes + (copying ? inFlight.value : 0)
+            state.completedBytes = transferred
+            state.elapsedSeconds = now.timeIntervalSince(started)
+            let activeSeconds: Double = state.elapsedSeconds - state.planSeconds - pausedSeconds
+            let transferElapsed: Double = max(0.001, activeSeconds)
+            state.bytesPerSecond = Double(transferred) / transferElapsed
+            if state.bytesPerSecond > 0 {
+                let remaining: Int64 = max(Int64(0), state.totalBytes - transferred)
+                state.eta = Double(remaining) / state.bytesPerSecond
+            } else {
+                state.eta = nil
+            }
+            if copying {
+                let liveSpan: Double = now.timeIntervalSince(liveStart)
+                if liveSpan >= 3 {
+                    state.liveMBps = Double(transferred - liveBytes) / liveSpan / 1_000_000
+                    liveStart = now
+                    liveBytes = transferred
+                }
+                let sampleSpan: Double = now.timeIntervalSince(sampleStart)
+                if sampleSpan >= state.sampleSeconds {
+                    let mbps: Double = Double(transferred - sampleBytes) / sampleSpan / 1_000_000
+                    state.speedSamples.append(mbps)
+                    state.peakMBps = max(state.peakMBps, mbps)
+                    sampleStart = now
+                    sampleBytes = transferred
+                    if state.speedSamples.count >= DigiFastBackupEngine.maxSpeedSamples {
+                        state.speedSamples = DigiFastBackupEngine.foldSamples(state.speedSamples)
+                        state.sampleSeconds *= 2
+                    }
+                }
+            }
+            let reportStarted = Date()
+            await report(state)
+            state.reportSeconds += Date().timeIntervalSince(reportStarted)
+            lastUpdate = Date()
+        }
+
+        /// Waits while paused and keeps the screen honest: "Pausing…" while a
+        /// copy is still writing, then "Paused" once nothing is being written.
+        func pauseIfNeeded() async throws {
+            guard control.isPaused && !control.isStopped else {
+                try await control.checkpoint()
+                return
+            }
+            let pauseStarted = Date()
+            let resumeStatus: String = state.status
+            var lastWritten: Int64 = inFlight.value
+            state.status = "Pausing…"
+            await publish(force: true)
+            while control.isPaused && !control.isStopped {
+                try await Task.sleep(nanoseconds: 250_000_000)
+                let written: Int64 = inFlight.value
+                state.liveMBps = 0
+                if written == lastWritten && state.status != "Paused" {
+                    state.status = "Paused"
+                    await publish(force: true)
+                } else {
+                    await publish()
+                }
+                lastWritten = written
+            }
+            pausedSeconds += Date().timeIntervalSince(pauseStarted)
+            state.status = resumeStatus
+            try await control.checkpoint()
+        }
+
+        await publish(force: true)
+        // Stops in-flight copies quickly if another file fails.
+        let abort = BackupControl(parent: control)
+        var temporaries = Set<URL>()
+        var largeCount = 0, smallCount = 0
+        var largeBytes: Int64 = 0, smallBytes: Int64 = 0
+        var largeSeconds: Double = 0
+        var copyStarted = Date()
+
+        do {
+            try await control.checkpoint()
+            let planStarted = Date()
+            let inventory = try supplied ?? DigiFastBackupEngine.snapshot(source, filter: filter, control: control)
+            let plan = try DigiFastBackupEngine.plan(source: source, destination: destination, filter: filter,
+                                                     snapshot: inventory, control: control)
+            let root = destination.resolvingSymlinksInPath().standardizedFileURL
+            let expectedDevice = try deviceNumber(root)
+            reportRoot = root
+            reportDevice = expectedDevice
+
+            // Refuse to start if the planned copies cannot fit.
+            var neededBytes: Int64 = 0
+            var largestReplacement: Int64 = 0
+            for change in plan.changes {
+                let existing = (try? fm.attributesOfItem(atPath: change.destination.path))?[.size] as? NSNumber
+                if !archiveChanged, let existing {
+                    neededBytes += max(Int64(0), change.size - existing.int64Value)
+                    largestReplacement = max(largestReplacement, change.size)
+                } else {
+                    neededBytes += change.size
+                }
+            }
+            neededBytes += largestReplacement
+            if neededBytes > 0, let free = availableSpace(root), neededBytes > free {
+                let needed = ByteCountFormatter.string(fromByteCount: neededBytes, countStyle: .file)
+                let available = ByteCountFormatter.string(fromByteCount: free, countStyle: .file)
+                throw failure("Not enough space on this drive: this backup needs " + needed + " but only " + available + " is free. No files were copied.")
+            }
+
+            for directory in inventory.directories {
+                try await control.checkpoint()
+                try ensureDirectory(directory, under: root, device: expectedDevice)
+            }
+            state.planSeconds = Date().timeIntervalSince(planStarted)
+            state.totalFiles = plan.changes.count
+            state.totalBytes = plan.changes.reduce(Int64(0)) { $0 + $1.size }
+            state.unchangedFiles = plan.unchanged
+            state.status = plan.changes.isEmpty ? "No new or changed files" : "Copying new and changed files"
+            await publish(force: true)
+
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + "-" + String(UUID().uuidString.prefix(8))
+            let archivePrefix = DigiFastBackupEngine.archiveName + "/" + stamp
+            var current = plan.manifest
+            let keys = Set(inventory.files.map(\.relative))
+            reportKeys = keys
+            current.files = current.files.filter { !filter.includes($0.key) || keys.contains($0.key) }
+            for relative in keys { current.files[relative] = "size-date-match" }
+
+            let large: [BackupEntry] = plan.changes.filter { $0.size >= largeFileThreshold }
+            let small: [BackupEntry] = plan.changes.filter { $0.size < largeFileThreshold }
+
+            func commit(_ staged: Staged) throws {
+                let entry = staged.entry
+                let temporary = staged.temporary
+                try checkSourceUnchanged(entry)
+                let copied = try fm.attributesOfItem(atPath: temporary.path)
+                let copiedIsFile = copied[.type] as? FileAttributeType == .typeRegular
+                let copiedSize = (copied[.size] as? NSNumber)?.int64Value
+                guard copiedIsFile && copiedSize == entry.size else {
+                    throw failure("Copied size differs from the source: " + entry.relative)
+                }
+                try checkDirectory(entry.destination.deletingLastPathComponent(), device: expectedDevice)
+                let finalizeStarted = Date()
+                try fm.setAttributes([.modificationDate: entry.modified], ofItemAtPath: temporary.path)
+                if fm.fileExists(atPath: entry.destination.path) {
+                    if archiveChanged {
+                        let relative = archivePrefix + "/Replaced/" + entry.relative
+                        let parent = (relative as NSString).deletingLastPathComponent
+                        try ensureDirectory(parent, under: root, device: expectedDevice)
+                        let archived = root.appendingPathComponent(relative)
+                        try fm.moveItem(at: entry.destination, to: archived)
+                        do {
+                            try fm.moveItem(at: temporary, to: entry.destination)
+                        } catch {
+                            do { try fm.moveItem(at: archived, to: entry.destination) }
+                            catch { throw failure("Could not restore the previous file; it remains at " + archived.path) }
+                            throw error
+                        }
+                    } else {
+                        _ = try fm.replaceItemAt(entry.destination, withItemAt: temporary,
+                                                 backupItemName: nil, options: .usingNewMetadataOnly)
+                    }
+                } else {
+                    try fm.moveItem(at: temporary, to: entry.destination)
+                }
+                state.finalizeSeconds += Date().timeIntervalSince(finalizeStarted)
+                temporaries.remove(temporary)
+                current.files[entry.relative] = "copied-size-date"
+                if let checksum = staged.checksum {
+                    verified.append((entry.relative, checksum))
+                    state.verifiedFiles += 1
+                }
+                state.completedFiles += 1
+                committedBytes += entry.size
+                // Bytes for this file move from "in flight" to "committed".
+                inFlight.add(-entry.size)
+                if staged.lane == .large {
+                    largeCount += 1; largeBytes += entry.size; largeSeconds += staged.seconds
+                } else {
+                    smallCount += 1; smallBytes += entry.size
+                }
+            }
+
+            copyStarted = Date()
+            liveStart = copyStarted; liveBytes = 0
+            sampleStart = copyStarted; sampleBytes = 0
+            copying = !plan.changes.isEmpty
+
+            if copying {
+                try await withThrowingTaskGroup(of: LaneResult.self) { group in
+                    var nextLarge = 0, nextSmall = 0
+                    var largeActive = 0, smallActive = 0
+                    var tickActive = false
+
+                    func admit(_ entry: BackupEntry, lane: Lane) {
+                        let temporary = entry.destination.deletingLastPathComponent()
+                            .appendingPathComponent(".shootwrap-" + UUID().uuidString + ".tmp")
+                        temporaries.insert(temporary)
+                        state.status = "Copying " + entry.relative
+                        let laneControl = abort
+                        let counter = inFlight
+                        let device = expectedDevice
+                        let laneGate = gate
+                        group.addTask(priority: .userInitiated) {
+                            try checkDirectory(entry.destination.deletingLastPathComponent(), device: device)
+                            try checkSourceUnchanged(entry)
+                            if let attributes = try? FileManager().attributesOfItem(atPath: entry.destination.path),
+                               attributes[.type] as? FileAttributeType != .typeRegular {
+                                throw failure("A directory or symbolic link blocks the destination: " + entry.relative)
+                            }
+                            let copyBegan = Date()
+                            let checksum: UInt64? = try await runBlocking { () throws -> UInt64? in
+                                try waitIfPaused(laneControl)
+                                func copyOnce() throws -> UInt64? {
+                                    if lane == .large {
+                                        return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
+                                                             control: laneControl, written: counter, verify: verify)
+                                    }
+                                    let value = try copySmall(source: entry.source, target: temporary, verify: verify, control: laneControl)
+                                    counter.add(entry.size)
+                                    return value
+                                }
+                                // v1.25: a bad read-back gets one fresh copy before it counts as a failure.
+                                var attempt = 0
+                                while true {
+                                    do {
+                                        if let laneGate {
+                                            return try laneGate.withPolicy { try copyOnce() }
+                                        }
+                                        return try copyOnce()
+                                    } catch is ChecksumMismatch where attempt == 0 {
+                                        attempt += 1
+                                        try? FileManager().removeItem(at: temporary)
+                                        if lane == .large { counter.add(-entry.size) }
+                                    } catch is ChecksumMismatch {
+                                        throw ChecksumMismatch(relative: entry.relative)
+                                    }
+                                }
+                            }
+                            let seconds = Date().timeIntervalSince(copyBegan)
+                            return .staged(Staged(entry: entry, temporary: temporary, lane: lane, seconds: seconds, checksum: checksum))
+                        }
+                    }
+
+                    func addTick() {
+                        tickActive = true
+                        group.addTask {
+                            try? await Task.sleep(nanoseconds: 400_000_000)
+                            return .tick
+                        }
+                    }
+
+                    do {
+                        while true {
+                            try await pauseIfNeeded()
+                            while largeActive < 1 && nextLarge < large.count {
+                                admit(large[nextLarge], lane: .large)
+                                nextLarge += 1; largeActive += 1
+                            }
+                            while smallActive < smallLaneWidth && nextSmall < small.count {
+                                admit(small[nextSmall], lane: .small)
+                                nextSmall += 1; smallActive += 1
+                            }
+                            if largeActive + smallActive == 0 { break }
+                            if !tickActive { addTick() }
+                            await publish()
+                            let waitStarted = Date()
+                            guard let result = try await group.next() else {
+                                throw failure("The copy queue ended before completion")
+                            }
+                            state.copySeconds += Date().timeIntervalSince(waitStarted)
+                            switch result {
+                            case .tick:
+                                tickActive = false
+                            case .staged(let staged):
+                                if staged.lane == .large { largeActive -= 1 } else { smallActive -= 1 }
+                                // Never commit a finished copy after Stop.
+                                try await pauseIfNeeded()
+                                try commit(staged)
+                                await publish()
+                            }
+                        }
+                    } catch {
+                        // Stop the other in-flight copies at their next chunk; the
+                        // group waits for them before temporaries are removed.
+                        abort.stop()
+                        group.cancelAll()
+                        throw error
+                    }
+                    group.cancelAll()
+                }
+            }
+            copying = false
+
+            try await control.checkpoint()
+            let finishStarted = Date()
+            if archiveRemoved {
+                for relative in plan.removed {
+                    try await control.checkpoint()
+                    let old = root.appendingPathComponent(relative)
+                    if !fm.fileExists(atPath: old.path) { continue }
+                    try checkDirectory(old.deletingLastPathComponent(), device: expectedDevice)
+                    let attributes = try fm.attributesOfItem(atPath: old.path)
+                    guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                        throw failure("Cannot archive non-file: " + relative)
+                    }
+                    let target = archivePrefix + "/Removed from source/" + relative
+                    try ensureDirectory((target as NSString).deletingLastPathComponent, under: root, device: expectedDevice)
+                    try fm.moveItem(at: old, to: root.appendingPathComponent(target))
+                    removedThisRun.append(relative)
+                }
+            }
+            try await control.checkpoint()
+            try checkDirectory(root, device: expectedDevice)
+            try JSONEncoder().encode(current).write(to: root.appendingPathComponent(DigiFastBackupEngine.manifestName), options: .atomic)
+            state.finalizeSeconds += Date().timeIntervalSince(finishStarted)
+            state.status = DigiFastBackupEngine.completeStatus
+        } catch is CancellationError {
+            state.status = "Stopped safely. Completed files retained."
+        } catch {
+            state.errorCount += 1
+            state.status = "Error: " + error.localizedDescription
+        }
+        copying = false
+        // The task group has drained, so no copy is still writing these.
+        for temporary in temporaries { try? fm.removeItem(at: temporary) }
+
+        // v1.25: checksum list and report on the drive, even after a stop or error,
+        // so every file that was verified is on record.
+        if verify, let root = reportRoot, let device = reportDevice {
+            let input = DigiBackupReport.Input(
+                source: source, destination: root, device: device, started: started, finished: Date(),
+                status: state.status, verified: verified, removed: removedThisRun,
+                unchangedFiles: state.unchangedFiles, sourceKeys: reportKeys,
+                copiedBytes: committedBytes)
+            do {
+                state.reportPath = try DigiBackupReport.write(input)
+            } catch {
+                state.engineNote = "Couldn't write the checksum report: " + error.localizedDescription
+            }
+        }
+
+        if largeCount + smallCount > 0 {
+            let copyWall: Double = max(0.001, Date().timeIntervalSince(copyStarted))
+            let largeText: String = ByteCountFormatter.string(fromByteCount: largeBytes, countStyle: .file)
+            var note: String = displayName + " · large files: \(largeCount), " + largeText
+            if largeSeconds > 0 {
+                let largeRate: Double = Double(largeBytes) / largeSeconds / 1_000_000
+                note += String(format: " at %.0f MB/s", largeRate)
+            }
+            let smallText: String = ByteCountFormatter.string(fromByteCount: smallBytes, countStyle: .file)
+            note += " · small files: \(smallCount), " + smallText
+            note += String(format: " · copy time %.0fs", copyWall)
+            if state.engineNote.isEmpty { state.engineNote = note } else { state.engineNote = note + " · " + state.engineNote }
+        } else if state.engineNote.isEmpty {
+            state.engineNote = displayName
+        }
+        await publish(force: true)
+        state.completedBytes = committedBytes
+        state.eta = nil
+        state.elapsedSeconds = Date().timeIntervalSince(started)
+        await report(state)
+        return state
+    }
+}

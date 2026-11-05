@@ -1,0 +1,12 @@
+Digi Suite workspace integration preview
+
+- Collapsible shared folder browser in the main window, hidden by default.
+- Active workspace/session name visible across tabs.
+- Contact Sheets can choose multiple nested folders from the workspace directory tree.
+- External image/folder selection remains available.
+- Separate per-window WrapModel, with Cmd+N New Workspace menu action.
+- Double-click 00_BUILD_DIGI_SUITE.command to compile and launch.
+
+IMPORTANT: This source revision was prepared in a Linux environment without macOS SwiftUI frameworks. It has NOT been compiled or tested on macOS. Keep the previously notarized app as a backup. Build locally and share any compiler errors for correction. This development build is not notarized.
+
+Known follow-up: Some existing global menu command notifications and the menu-bar status still need per-window routing for complete multi-workspace isolation. Existing non-Contact-Sheets tabs may retain independent folder pickers; full shared-context migration is not yet complete.

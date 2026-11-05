@@ -1,0 +1,1 @@
+Uses lsof -nP -Fn -p <Capture One PID> to list actual open .cosessiondb database paths. No Spotlight search; excludes unopened backup copies. AppleScript used only for default selection. When lsof cannot see open handles, manual selection remains available. Detection is advisory, never starts backups. macOS compilation not available in this environment.

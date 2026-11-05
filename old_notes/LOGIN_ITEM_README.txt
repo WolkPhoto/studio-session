@@ -1,0 +1,1 @@
+Open Digi Suite at login: Digi Suite > Settings > General. Uses macOS SMAppService.mainApp. For reliable login item registration, move the built Digi Suite.app into /Applications before enabling. macOS may require approval in System Settings > General > Login Items & Extensions.\n

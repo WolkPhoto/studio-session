@@ -1,0 +1,1 @@
+Processed Files Check: auto-detect immediate session subdirectories containing Capture or Output (case-insensitive). Exact match preferred, followed by numbered prefix, then other keyword matches. Ambiguous matches require manual selection. Existing manual overrides are respected. No changes to Folder Maker, Backup Sync, or other tabs. Mac compilation not available.
