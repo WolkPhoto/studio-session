@@ -257,9 +257,50 @@ enum DigiBackupReport {
         var renamedPaths: Set<String> = []
         var archived: Int = 0
         var repaired: Int = 0
+        /// v1.29: files skipped because the source was still being written.
+        var skipped: [String] = []
+        /// v1.37: files that couldn't be backed up as they are (unreadable, lock), with why.
+        var problems: [(String, String)] = []
     }
 
     static func files(_ count: Int) -> String { count == 1 ? "1 file" : "\(count) files" }
+
+    // v1.29: the saved run reports and drive-check reports on a drive. The
+    // checksum list (Checksums.xxh64) is never counted here and never cleared,
+    // because incrementals and drive checks need it.
+    struct ReportInfo: Sendable, Equatable {
+        var count: Int = 0
+        var bytes: Int64 = 0
+        var isEmpty: Bool { count == 0 }
+    }
+
+    static func reportInfo(_ destination: URL) -> ReportInfo {
+        let folder = destination.appendingPathComponent(DigiFastBackupEngine.reportsName, isDirectory: true)
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) else { return ReportInfo() }
+        var info = ReportInfo()
+        for item in items where item.pathExtension.lowercased() == "txt" {
+            info.count += 1
+            let size = (try? item.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            info.bytes += Int64(size)
+        }
+        return info
+    }
+
+    /// Deletes only the .txt reports in _StudioSession_Reports; keeps the
+    /// checksum list and never touches the backup. Returns how many were removed.
+    @discardableResult
+    static func clearReports(_ destination: URL) throws -> Int {
+        let folder = destination.appendingPathComponent(DigiFastBackupEngine.reportsName, isDirectory: true)
+        let fm = FileManager.default
+        let items = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        var removed = 0
+        for item in items where item.pathExtension.lowercased() == "txt" {
+            try fm.removeItem(at: item)
+            removed += 1
+        }
+        return removed
+    }
 
     /// v1.26: "Capture/LG" for "Capture/LG/Scene_1/a.ARW"; files at the top level group as one.
     static func group(for relative: String) -> String {
@@ -288,7 +329,9 @@ enum DigiBackupReport {
     /// Writes the checksum list and the run report. Returns the report's path.
     static func write(_ input: Input) throws -> String {
         // Nothing new (a scheduled backup that found no changes): no new report.
-        if input.verified.isEmpty && input.removed.isEmpty && input.status == DigiFastBackupEngine.completeStatus { return "" }
+        // v1.29: a run that only skipped busy files still gets a report, so there
+        // is a record of what was left for the next run.
+        if input.verified.isEmpty && input.removed.isEmpty && input.skipped.isEmpty && input.problems.isEmpty && input.status == DigiFastBackupEngine.completeStatus { return "" }
         let fm = FileManager.default
         try DigiStreamEngine.ensureDirectory(DigiFastBackupEngine.reportsName, under: input.destination, device: input.device)
         let folder = input.destination.appendingPathComponent(DigiFastBackupEngine.reportsName, isDirectory: true)
@@ -318,7 +361,12 @@ enum DigiBackupReport {
         readable.timeStyle = .medium
         let volumeValues = try? input.destination.resourceValues(forKeys: [.volumeNameKey, .volumeUUIDStringKey, .volumeTotalCapacityKey])
         let volumeName = volumeValues?.volumeName ?? input.destination.lastPathComponent
-        let missing = input.sourceKeys.filter { list[$0] == nil }.count
+        // v1.37: files skipped this run (busy or a problem) weren't copied, so they aren't
+        // "missing a checksum"; they're listed in their own sections instead.
+        var notCopiedThisRun = Set(input.skipped)
+        for (relative, _) in input.problems { notCopiedThisRun.insert(relative) }
+        let inBackup: Set<String> = input.sourceKeys.subtracting(notCopiedThisRun)
+        let missing = inBackup.filter { list[$0] == nil }.count
         let complete = input.status == DigiFastBackupEngine.completeStatus
         let byteText = ByteCountFormatter.string(fromByteCount: input.copiedBytes, countStyle: .file)
         let copiedCount = input.verified.filter { !input.renamedPaths.contains($0.0) }.count
@@ -330,7 +378,11 @@ enum DigiBackupReport {
         if input.readBack && input.readBackDone < copiedCount {
             notDone += " (\(input.readBackDone) of \(copiedCount) copies verified before it stopped)"
         }
-        text += "Result:    " + (complete ? doneLine : notDone) + "\n\n"
+        var resultLine: String = complete ? doneLine : notDone
+        if complete && !input.problems.isEmpty {
+            resultLine = "COMPLETE EXCEPT " + files(input.problems.count).uppercased() + " THAT COULDN'T BE BACKED UP (listed below)"
+        }
+        text += "Result:    " + resultLine + "\n\n"
         text += "Session:   " + input.source.lastPathComponent + "\n"
         text += "From:      " + input.source.path + "\n"
         text += "To:        " + input.destination.path + "\n"
@@ -354,9 +406,34 @@ enum DigiBackupReport {
             text += "Older versions moved to the archive:  " + files(input.archived) + "\n"
         }
         text += "Already on the drive, unchanged:  " + files(input.unchangedFiles) + "\n"
-        text += "Files in this backup with a checksum on record:  \(input.sourceKeys.count - missing) of \(input.sourceKeys.count)\n"
+        if !input.skipped.isEmpty {
+            text += "\nSTILL BEING WRITTEN, SKIPPED THIS RUN:  " + files(input.skipped.count) + "\n"
+            text += "These files were changing on the source while the backup ran (Capture One or a\n"
+            text += "tether still writing them), so they were left alone. Run Back Up again to copy them.\n"
+            for relative in input.skipped.sorted().prefix(200) {
+                text += "  - " + relative + "\n"
+            }
+            if input.skipped.count > 200 {
+                text += "  ...and \(input.skipped.count - 200) more.\n"
+            }
+            text += "\n"
+        }
+        if !input.problems.isEmpty {
+            text += "\nCOULDN'T BE BACKED UP:  " + files(input.problems.count) + "\n"
+            text += "These files couldn't be copied as they are, so they are NOT on this drive. Everything\n"
+            text += "else was backed up. Fix them (for example, File > Get Info > Sharing & Permissions),\n"
+            text += "then run Back Up again.\n"
+            for (relative, reason) in input.problems.sorted(by: { $0.0 < $1.0 }).prefix(200) {
+                text += "  - " + relative + ": " + reason + "\n"
+            }
+            if input.problems.count > 200 {
+                text += "  ...and \(input.problems.count - 200) more.\n"
+            }
+            text += "\n"
+        }
+        text += "Files in this backup with a checksum on record:  \(inBackup.count - missing) of \(inBackup.count)\n"
         if missing > 0 {
-            text += "  \(missing) files were copied before checksums were turned on. Check them with Compare > Deep Verify.\n"
+            text += "  " + files(missing) + " without one (copied before checksums were turned on). Check them with Folder Checker > Deep Verify.\n"
         }
         if input.readBack {
             text += "\nHow files were checked: xxHash64. Each original was hashed while it was copied.\n"

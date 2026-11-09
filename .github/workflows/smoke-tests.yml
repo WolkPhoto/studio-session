@@ -1,0 +1,24 @@
+# Studio Session: run the backup-engine smoke tests on a GitHub-hosted Mac.
+# Same tests build_all.command runs first on Jeff's Mac (RUN_FAST_BACKUP_TESTS.command).
+# Runs on every push and can be started by hand (Actions tab > Smoke tests > Run workflow).
+# Free plan: macOS minutes count 10x against the 2,000 included minutes (about 200 Mac minutes/month).
+name: Smoke tests
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: xcrun swiftc --version
+      - name: Backup engine smoke tests
+        run: bash RUN_FAST_BACKUP_TESTS.command

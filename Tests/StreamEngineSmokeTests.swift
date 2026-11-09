@@ -277,6 +277,140 @@ enum StreamEngineSmokeTests {
         try check(fm.fileExists(atPath: keepFile.path), "Clearing the archive touched the backup itself")
         print("PASS (v1.25): archive size, trim oldest, clear all")
 
+        // v1.29: a file whose size/date stamp moved since the scan (still being
+        // written) is skipped, the rest of the backup finishes, and it's reported.
+        let skipTarget = fixture.appendingPathComponent("SkipTarget", isDirectory: true)
+        try fm.createDirectory(at: skipTarget, withIntermediateDirectories: false)
+        let skipSnapshot = try DigiFastBackupEngine.snapshot(source, filter: BackupFilter())
+        let busy = source.appendingPathComponent("Settings/Big1.ARW.cos")
+        try Data("<settings/ this is much longer than it was at scan time>".utf8).write(to: busy)
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_900_000)], ofItemAtPath: busy.path)
+        let skipRun = await DigiStreamEngine.sync(source: source, destination: skipTarget, archiveChanged: true, archiveRemoved: true,
+            filter: BackupFilter(), snapshot: skipSnapshot, control: BackupControl(), verify: true, readBack: false, report: { _ in })
+        try check(skipRun.status == DigiFastBackupEngine.completeStatus, "Skip run did not finish: " + skipRun.status)
+        try check(skipRun.errorCount == 0, "Skip run reported an error")
+        try check(skipRun.skippedFiles == 1, "Expected 1 skipped file, got \(skipRun.skippedFiles)")
+        try check(!fm.fileExists(atPath: skipTarget.appendingPathComponent("Settings/Big1.ARW.cos").path), "A file still being written should have been skipped, not copied")
+        try check(fm.fileExists(atPath: skipTarget.appendingPathComponent("Capture/Big1.ARW").path), "Other files should still copy around a skipped file")
+        try check((try? leakedTemporaries(skipTarget)) != true, "A skipped file left a temp behind")
+        let skipReport = try String(contentsOfFile: skipRun.reportPath, encoding: .utf8)
+        try check(skipReport.contains("STILL BEING WRITTEN, SKIPPED THIS RUN"), "Report doesn't list the skipped file")
+        // v1.30: near-exact. Any real change is a skip; only sub-millisecond
+        // timestamp-API noise is tolerated.
+        try check(DigiStreamEngine.sourceMoved(size: 100, recordedSize: 100, drift: 0.0) == false, "An identical file should not be skipped")
+        try check(DigiStreamEngine.sourceMoved(size: 100, recordedSize: 100, drift: 0.0005) == false, "Sub-millisecond timestamp noise should be tolerated")
+        try check(DigiStreamEngine.sourceMoved(size: 100, recordedSize: 100, drift: 0.2) == true, "A real sub-second change should be skipped")
+        try check(DigiStreamEngine.sourceMoved(size: 100, recordedSize: 100, drift: 3.0) == true, "A multi-second change should be skipped")
+        try check(DigiStreamEngine.sourceMoved(size: 101, recordedSize: 100, drift: 0.0) == true, "A size change should be skipped")
+        print("PASS (v1.30): busy file skipped, rest copied, skip reported, near-exact change detection")
+
+        // v1.33: a hard-interrupted run leaves orphaned .shootwrap-*.tmp files; the
+        // next backup sweeps them. Real files and the archive folder are untouched.
+        let orphan = skipTarget.appendingPathComponent("Capture/.shootwrap-DEADBEEF-TEST.tmp")
+        try Data(count: 4096).write(to: orphan)
+        try check(fm.fileExists(atPath: orphan.path), "test could not create the orphan temp")
+        let sweptTemps = DigiStreamEngine.removeOrphanTemps(in: skipTarget)
+        try check(sweptTemps == 1, "expected to sweep 1 orphan temp, swept \(sweptTemps)")
+        try check(!fm.fileExists(atPath: orphan.path), "orphan temp was not swept")
+        try check(fm.fileExists(atPath: skipTarget.appendingPathComponent("Capture/Big1.ARW").path), "sweep removed a real file")
+        print("PASS (v1.33): orphan temp sweep")
+
+        // v1.36: exFAT/FAT destinations get cached large-file writes; APFS/HFS+ keep the uncached stream.
+        try check(DigiStreamEngine.prefersCachedWrites(filesystem: "exfat"), "exFAT should use cached writes")
+        try check(DigiStreamEngine.prefersCachedWrites(filesystem: "msdos"), "FAT should use cached writes")
+        try check(!DigiStreamEngine.prefersCachedWrites(filesystem: "apfs"), "APFS keeps the uncached stream")
+        try check(!DigiStreamEngine.prefersCachedWrites(filesystem: "hfs"), "HFS+ keeps the uncached stream")
+        let fixtureFS = DigiStreamEngine.filesystemType(skipTarget)
+        try check(!fixtureFS.isEmpty, "Could not read the test folder's filesystem type")
+        // The cached path must produce an identical copy too (run here on the test volume).
+        let cachedSource = skipTarget.appendingPathComponent("Capture/Big1.ARW")
+        let cachedCopy = skipTarget.appendingPathComponent("Capture/.cached-write-test.bin")
+        try? fm.removeItem(at: cachedCopy)
+        let cachedSize = (try fm.attributesOfItem(atPath: cachedSource.path)[.size] as? NSNumber)?.int64Value ?? -1
+        let cachedHash = try DigiStreamEngine.copyLarge(source: cachedSource, target: cachedCopy, expectedSize: cachedSize,
+            control: BackupControl(), written: DigiStreamEngine.ByteCounter(), verify: true, readBack: true, uncached: false)
+        try check(cachedHash != nil, "Cached-write copy returned no checksum")
+        let cachedCopyData = try Data(contentsOf: cachedCopy)
+        let cachedSourceData = try Data(contentsOf: cachedSource)
+        try check(cachedCopyData == cachedSourceData, "Cached-write copy differs from the source")
+        try? fm.removeItem(at: cachedCopy)
+        print("PASS (v1.36): exFAT/FAT use cached large-file writes (this volume: \(fixtureFS)); cached path copies byte for byte")
+
+        // v1.37: one unreadable or Finder-locked file must not block the whole backup (Nov 9, D6).
+        // Unreadable: skipped and flagged. Locked: backed up, and the backup copy is locked too.
+        let problemSource = fixture.appendingPathComponent("ProblemSource", isDirectory: true)
+        let problemTarget = fixture.appendingPathComponent("ProblemTarget", isDirectory: true)
+        for folder in [problemSource, problemTarget] { try fm.createDirectory(at: folder, withIntermediateDirectories: true) }
+        let fineURL = problemSource.appendingPathComponent("fine.txt")
+        let lockedURL = problemSource.appendingPathComponent("locked.txt")
+        let lockedBigURL = problemSource.appendingPathComponent("locked_big.bin")
+        let unreadableURL = problemSource.appendingPathComponent("no_read.txt")
+        try Data("fine".utf8).write(to: fineURL)
+        try Data("locked v1".utf8).write(to: lockedURL)
+        try Data(repeating: 7, count: 9 * 1024 * 1024).write(to: lockedBigURL)   // large lane
+        try Data("secret".utf8).write(to: unreadableURL)
+        for url in [fineURL, lockedURL, lockedBigURL, unreadableURL] {
+            try fm.setAttributes([.modificationDate: stamp], ofItemAtPath: url.path)
+        }
+        func unlockTree(_ folder: URL) {
+            _ = chflags(folder.path, 0)
+            guard let walker = fm.enumerator(atPath: folder.path) else { return }
+            for case let relative as String in walker { _ = chflags(folder.appendingPathComponent(relative).path, 0) }
+        }
+        defer {
+            _ = chmod(unreadableURL.path, 0o644)
+            unlockTree(problemSource)
+            unlockTree(problemTarget)
+        }
+        _ = chmod(unreadableURL.path, 0)
+        _ = chflags(lockedURL.path, UInt32(UF_IMMUTABLE))
+        _ = chflags(lockedBigURL.path, UInt32(UF_IMMUTABLE))
+        func isLocked(_ url: URL) -> Bool {
+            guard let flags = DigiStreamEngine.fileFlags(url) else { return false }
+            return flags & UInt32(UF_IMMUTABLE) != 0
+        }
+        func problemRun() async -> SyncProgress {
+            await DigiStreamEngine.sync(source: problemSource, destination: problemTarget, archiveChanged: true, archiveRemoved: true,
+                                        filter: BackupFilter(), control: BackupControl(), verify: true, readBack: true, report: { _ in })
+        }
+        let problemFirst = await problemRun()
+        try check(problemFirst.status == DigiFastBackupEngine.completeStatus, "A problem file blocked the backup: " + problemFirst.status)
+        try check(problemFirst.errorCount == 0, "A problem file was counted as an error")
+        try check(problemFirst.problemFiles == 1, "Expected 1 file flagged as not backed up, got \(problemFirst.problemFiles)")
+        try check(fm.fileExists(atPath: problemTarget.appendingPathComponent("fine.txt").path), "fine.txt should be backed up around the problem file")
+        try check(!fm.fileExists(atPath: problemTarget.appendingPathComponent("no_read.txt").path), "The unreadable file should not be on the backup")
+        let lockedCopy = problemTarget.appendingPathComponent("locked.txt")
+        let lockedBigCopy = problemTarget.appendingPathComponent("locked_big.bin")
+        let lockedCopyData = try Data(contentsOf: lockedCopy)
+        try check(lockedCopyData == Data("locked v1".utf8), "Locked small file was not backed up correctly")
+        let lockedBigCopyData = try Data(contentsOf: lockedBigCopy)
+        let lockedBigSourceData = try Data(contentsOf: lockedBigURL)
+        try check(lockedBigCopyData == lockedBigSourceData, "Locked large file was not backed up correctly")
+        try check(isLocked(lockedCopy) && isLocked(lockedBigCopy), "Backup copies of locked files should be locked too")
+        try check((try? leakedTemporaries(problemTarget)) != true, "A problem file left a temp behind")
+        let problemReport = try String(contentsOfFile: problemFirst.reportPath, encoding: .utf8)
+        try check(problemReport.contains("COULDN'T BE BACKED UP") && problemReport.contains("no_read.txt"), "Report doesn't list the file that couldn't be backed up")
+        try check(!problemReport.contains("copied before checksums"), "Report wrongly says a skipped file was copied before checksums")
+        // Change a locked original: the locked backup copy is archived and replaced, and stays locked.
+        _ = chflags(lockedURL.path, 0)
+        try Data("locked v2".utf8).write(to: lockedURL)
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_500)], ofItemAtPath: lockedURL.path)
+        _ = chflags(lockedURL.path, UInt32(UF_IMMUTABLE))
+        let problemSecond = await problemRun()
+        try check(problemSecond.status == DigiFastBackupEngine.completeStatus, "Replacing a locked backup copy failed: " + problemSecond.status)
+        let replacedData = try Data(contentsOf: lockedCopy)
+        try check(replacedData == Data("locked v2".utf8), "Locked file's new version was not backed up")
+        try check(isLocked(lockedCopy), "Replaced copy of a locked file should still be locked")
+        let archivedLocked = try archivedCopy(in: problemTarget, category: "Replaced", name: "locked.txt")
+        try check(archivedLocked == Data("locked v1".utf8), "Older version of a locked file was not archived")
+        // A temp that inherited a lock (left by an older build) is still swept.
+        let lockedOrphan = problemTarget.appendingPathComponent(".shootwrap-LOCKED-TEST.tmp")
+        try Data("x".utf8).write(to: lockedOrphan)
+        _ = chflags(lockedOrphan.path, UInt32(UF_IMMUTABLE))
+        let sweptLocked = DigiStreamEngine.removeOrphanTemps(in: problemTarget)
+        try check(sweptLocked == 1 && !fm.fileExists(atPath: lockedOrphan.path), "A locked orphan temp was not swept")
+        print("PASS (v1.37): unreadable file flagged + skipped, locked files backed up and kept locked, locked temps swept")
+
         print("PASS (v17): Digi Stream bytes, dates, permissions, extended attributes, empty folders, incrementals, archives, space check, mid-file and paused stop")
     }
 }

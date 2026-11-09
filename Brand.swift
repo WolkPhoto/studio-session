@@ -87,7 +87,7 @@ enum DigiBrand {
     static let name = "Studio Session"
     static let tagline = "Every frame, twice."
     static let nav = DigiNavStyle.sidebar
-    static let toolNames = ["Home", "Copy", "Selects", "Exports", "Folders", "Report", "Sheets", "Check", "Metadata"]
+    static let toolNames = ["Home", "Backups", "Selects Report", "Export Check", "Folder Maker", "Job Report", "Contact Sheets", "Folder Checker", "Metadata"]
     static let fixedTheme = DigiTheme(scheme: .dark,
         background: Color(digiHex: 0x0E0F10), surface: Color(digiHex: 0x17191B), raised: Color(digiHex: 0x1E2124),
         line: Color(digiHex: 0x2A2D31), text: Color(digiHex: 0xECEAE4), subtext: Color(digiHex: 0x9A9EA4),
@@ -283,7 +283,7 @@ enum DigiBrand {
 #if BRAND_GRIP
     static let welcomeLine = "Studio Session keeps a shoot's files safe and organized, from the first frame to the wrap. This takes about a minute."
     static let navTitle = "Getting around"
-    static let navBody = "Every tool is in the sidebar on the left. Press Command and a number to jump: Command-1 is the top tool in the sidebar, Command-2 the next, and so on. The sidebar button (or Control-Command-S) shrinks it to icons. Drag a tool up or down to rearrange, or off to the right to remove it."
+    static let navBody = "Every tool is a tab across the top. Press Command and a number to jump: Command-1 is the first tab, Command-2 the next, and so on. Drag a tab sideways to rearrange, or off the bar to remove it. Add a removed tool back with the + at the end of the tabs."
 #elseif BRAND_WRAP
     static let welcomeLine = "Wrap gets your shoot from first frame to that's-a-wrap without losing a file. Quick tour, promise."
     static let navTitle = "Every tool, one click"

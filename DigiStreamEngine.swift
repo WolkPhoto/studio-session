@@ -60,10 +60,90 @@ enum DigiStreamEngine {
         }
     }
 
+    // v1.29: a source file whose size or date stamp moved while the backup was
+    // running (Capture One or a tether still writing it). This is not fatal:
+    // the file is skipped, the rest of the backup finishes, and the skipped
+    // files are reported so the next run catches them.
+    struct SourceChanged: Error {
+        let relative: String
+    }
+
+    /// v1.37: a source file that can't be backed up as it is (no read permission, or a Finder
+    /// lock that couldn't be worked around). It is skipped and flagged; the rest of the backup
+    /// carries on. Before 1.37 one such file ended the whole drive's backup (Nov 9, D6).
+    struct SourceProblem: Error {
+        let relative: String
+        let reason: String
+    }
+
+    /// v1.37: Finder "Locked" (uchg) and append-only flags. copyfile carries them onto the
+    /// temp copy, after which it can't be dated, moved into place or deleted.
+    static func fileFlags(_ url: URL) -> UInt32? {
+        #if canImport(Darwin)
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return nil }
+        return info.st_flags
+        #else
+        return nil
+        #endif
+    }
+
+    static var lockFlags: UInt32 {
+        #if canImport(Darwin)
+        return UInt32(UF_IMMUTABLE) | UInt32(UF_APPEND)
+        #else
+        return 0
+        #endif
+    }
+
+    /// Clears the lock flags if set. Returns the original flags (to restore later), or nil
+    /// when the file wasn't locked. Throws if a locked file couldn't be unlocked.
+    static func unlockIfLocked(_ url: URL) throws -> UInt32? {
+        #if canImport(Darwin)
+        guard let flags = fileFlags(url), flags & lockFlags != 0 else { return nil }
+        guard chflags(url.path, flags & ~lockFlags) == 0 else { throw posixFailure("Could not unlock", url.path) }
+        return flags
+        #else
+        return nil
+        #endif
+    }
+
+    /// Puts back the flags unlockIfLocked returned (no-op for nil).
+    static func relock(_ url: URL, _ flags: UInt32?) {
+        #if canImport(Darwin)
+        guard let flags else { return }
+        _ = chflags(url.path, flags)
+        #endif
+    }
+
+    /// Removes one of the engine's own temp files, clearing any lock it inherited first.
+    static func removeTemp(_ url: URL) {
+        #if canImport(Darwin)
+        _ = chflags(url.path, 0)
+        #endif
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// v1.37: plain-language reason a source file can't be read, or nil if it can.
+    static func unreadableReason(_ url: URL) -> String? {
+        #if canImport(Darwin)
+        if access(url.path, R_OK) == 0 { return nil }
+        let code: Int32 = errno
+        if code == EACCES || code == EPERM { return "No permission to read it (check Get Info > Sharing & Permissions)" }
+        return "Couldn't be read: " + String(cString: strerror(code))
+        #else
+        return FileManager.default.isReadableFile(atPath: url.path) ? nil : "Couldn't be read"
+        #endif
+    }
+
     enum LaneResult: Sendable {
         case staged(Staged)
         /// v1.26: a large file's read-back finished; true when it matched.
         case checked(Staged, Bool)
+        /// v1.29: the source was still being written, so this file was skipped.
+        case skipped(BackupEntry, Lane)
+        /// v1.37: the source can't be backed up as it is (unreadable); skipped and flagged.
+        case problem(BackupEntry, Lane, String)
         case tick
     }
 
@@ -71,8 +151,68 @@ enum DigiStreamEngine {
         NSError(domain: "DigiSuiteStream", code: 17, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
+    /// v1.36: the destination's filesystem type as macOS names it ("apfs", "hfs", "exfat", "msdos"...).
+    static func filesystemType(_ url: URL) -> String {
+        #if canImport(Darwin)
+        var info = statfs()
+        guard statfs(url.path, &info) == 0 else { return "" }
+        let capacity = MemoryLayout.size(ofValue: info.f_fstypename)
+        return withUnsafePointer(to: &info.f_fstypename) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { String(cString: $0) }
+        }.lowercased()
+        #else
+        return ""
+        #endif
+    }
+
+    /// v1.36: exFAT and FAT drives get normal (cached) writes for large files.
+    /// Measured Nov 9 on an exFAT volume: uncached (F_NOCACHE) large-file writes running
+    /// alongside the small-file lane produced copies that read back as 0 bytes, or with the
+    /// right size and WRONG CONTENTS. The same engine with cached writes copied and verified
+    /// all 2,065 EdgeCases files byte for byte. APFS and HFS+ keep the uncached stream.
+    static func prefersCachedWrites(filesystem: String) -> Bool {
+        filesystem == "exfat" || filesystem == "msdos"
+    }
+
+    /// v1.33: delete orphaned `.shootwrap-*.tmp` files anywhere under the
+    /// destination, skipping the archive and reports folders. Only ever touches
+    /// the app's own temp files, by their unique name. Returns how many it removed.
+    @discardableResult
+    static func removeOrphanTemps(in destination: URL) -> Int {
+        let fm = FileManager.default
+        // Not .skipsHiddenFiles: the temps are hidden (leading dot).
+        guard let walker = fm.enumerator(at: destination, includingPropertiesForKeys: [.isDirectoryKey], options: []) else { return 0 }
+        var removed = 0
+        for case let item as URL in walker {
+            let name = item.lastPathComponent
+            if DigiFastBackupEngine.toolFolderNames.contains(name) {
+                let isDirectory = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                if isDirectory { walker.skipDescendants() }
+                continue
+            }
+            if name.hasPrefix(".shootwrap-") && name.hasSuffix(".tmp") {
+                // v1.37: a temp that inherited a Finder lock can't be deleted until it's unlocked.
+                #if canImport(Darwin)
+                _ = chflags(item.path, 0)
+                #endif
+                if (try? fm.removeItem(at: item)) != nil { removed += 1 }
+            }
+        }
+        return removed
+    }
+
     static func posixFailure(_ action: String, _ path: String) -> NSError {
         let code: Int32 = errno
+        // v1.33: a drive yanked mid-write reports ENXIO/EIO/ENODEV ("Device not
+        // configured" and friends). Say that in plain language instead.
+        if code == ENXIO || code == EIO || code == ENODEV {
+            var drive = "The drive"
+            let parts = path.components(separatedBy: "/")
+            if let volumesIndex = parts.firstIndex(of: "Volumes"), volumesIndex + 1 < parts.count, !parts[volumesIndex + 1].isEmpty {
+                drive = "\u{201C}" + parts[volumesIndex + 1] + "\u{201D}"
+            }
+            return failure(drive + " was disconnected during the backup. Reconnect it and run Back Up again.")
+        }
         let reason = String(cString: strerror(code))
         return failure(action + " " + path + ": " + reason)
     }
@@ -132,7 +272,7 @@ enum DigiStreamEngine {
     @discardableResult
     static func copyLarge(source: URL, target: URL, expectedSize: Int64,
                           control: BackupControl, written: ByteCounter, verify: Bool = false,
-                          readBack: Bool = true) throws -> UInt64? {
+                          readBack: Bool = true, uncached: Bool = true) throws -> UInt64? {
         let input = open(source.path, O_RDONLY)
         guard input >= 0 else { throw posixFailure("Could not open", source.path) }
         defer { close(input) }
@@ -142,7 +282,8 @@ enum DigiStreamEngine {
         defer { if outputOpen { close(output) } }
         #if canImport(Darwin)
         _ = fcntl(input, F_RDAHEAD, 1)
-        _ = fcntl(output, F_NOCACHE, 1)
+        // v1.36: no write-cache bypass on exFAT/FAT (see prefersCachedWrites).
+        if uncached { _ = fcntl(output, F_NOCACHE, 1) }
         #endif
         if expectedSize > 0 { preallocate(output, size: expectedSize) }
 
@@ -245,13 +386,29 @@ enum DigiStreamEngine {
         }
     }
 
+    /// v1.30: "has the source moved since we planned it?" A different size, or a
+    /// modification date that differs by more than a millisecond, means the file
+    /// is still being written, so it is skipped. This compares the SAME file at
+    /// two moments (snapshot vs copy), so an unchanged file reads identical and a
+    /// file being written reads different; the tiny 1 ms margin only absorbs
+    /// precision noise between the two timestamp APIs. (v1.29 used a 2 s window to
+    /// match the planner, but that let a file changing within 2 s of the snapshot
+    /// slip through on a quick backup, which is exactly the Capture One session
+    /// database case.) Factored out so it can be tested without the clock.
+    static func sourceMoved(size: Int64, recordedSize: Int64, drift: Double) -> Bool {
+        if size != recordedSize { return true }
+        return abs(drift) > 0.001
+    }
+
     static func checkSourceUnchanged(_ entry: BackupEntry) throws {
         let attributes = try FileManager.default.attributesOfItem(atPath: entry.source.path)
         let isFile = attributes[.type] as? FileAttributeType == .typeRegular
-        let sameSize = (attributes[.size] as? NSNumber)?.int64Value == entry.size
-        let sameDate = attributes[.modificationDate] as? Date == entry.modified
-        guard isFile && sameSize && sameDate else {
-            throw failure("Source changed during backup: " + entry.relative + ". Run the next incremental backup after it finishes writing.")
+        let currentSize = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+        let modified = attributes[.modificationDate] as? Date ?? Date.distantPast
+        let drift = modified.timeIntervalSince(entry.modified)
+        guard isFile && !sourceMoved(size: currentSize, recordedSize: entry.size, drift: drift) else {
+            // v1.29: skip-and-continue rather than aborting the whole backup.
+            throw SourceChanged(relative: entry.relative)
         }
     }
 
@@ -319,6 +476,11 @@ enum DigiStreamEngine {
                      report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
         let fm = FileManager.default
         let started = Date()
+        // v1.33: sweep orphaned temps left by a previous run that was interrupted
+        // hard (drive yanked, crash). Safe here: the caller holds the destination
+        // lock, so no active run owns any .shootwrap-*.tmp on this destination.
+        // They are pre-allocated to full file size, so leaving them wastes space.
+        removeOrphanTemps(in: destination)
         var state = SyncProgress(destination: destination.path, status: "Checking new and changed files…")
         state.verifyOn = verify
         state.readBackOn = verify && readBack
@@ -339,6 +501,9 @@ enum DigiStreamEngine {
         var reportRoot: URL?
         var reportDevice: NSNumber?
         var reportKeys: Set<String> = []
+        var skippedThisRun: [String] = []   // v1.29: files still being written
+        var problemsThisRun: [(String, String)] = []   // v1.37: files that couldn't be backed up, with why
+        var uncachedWrites = true           // v1.36: false on exFAT/FAT destinations
         let inFlight = ByteCounter()
         var committedBytes: Int64 = 0
         var lastUpdate = Date.distantPast
@@ -446,6 +611,8 @@ enum DigiStreamEngine {
                                                      snapshot: inventory, control: control)
             let root = destination.resolvingSymlinksInPath().standardizedFileURL
             let expectedDevice = try deviceNumber(root)
+            let destinationFS: String = filesystemType(root)
+            uncachedWrites = !prefersCachedWrites(filesystem: destinationFS)
             reportRoot = root
             reportDevice = expectedDevice
 
@@ -504,7 +671,9 @@ enum DigiStreamEngine {
                 guard !fm.fileExists(atPath: match.to.destination.path) else {
                     throw failure("A file appeared where a renamed file was going: " + match.to.relative + ". Run the backup again.")
                 }
+                let renameFlags: UInt32? = try unlockIfLocked(old)
                 try fm.moveItem(at: old, to: match.to.destination)
+                relock(match.to.destination, renameFlags)
                 verified.append((match.to.relative, match.checksum))
                 removedThisRun.append(match.from)
                 renamedPaths.insert(match.to.relative)
@@ -540,6 +709,16 @@ enum DigiStreamEngine {
                 }
                 try checkDirectory(entry.destination.deletingLastPathComponent(), device: expectedDevice)
                 let finalizeStarted = Date()
+                // v1.37: a Finder-locked original gives a locked temp; unlock it to date and
+                // place it, then lock the backup copy again so it matches the original.
+                let tempFlags: UInt32?
+                do { tempFlags = try unlockIfLocked(temporary) }
+                catch { throw SourceProblem(relative: entry.relative, reason: "Locked in Finder, and the copy couldn't be unlocked to finish it") }
+                var olderFlags: UInt32? = nil
+                if fm.fileExists(atPath: entry.destination.path) {
+                    do { olderFlags = try unlockIfLocked(entry.destination) }
+                    catch { throw SourceProblem(relative: entry.relative, reason: "The older backup copy is locked and couldn't be replaced") }
+                }
                 try fm.setAttributes([.modificationDate: entry.modified], ofItemAtPath: temporary.path)
                 if fm.fileExists(atPath: entry.destination.path) {
                     if archiveChanged {
@@ -548,6 +727,7 @@ enum DigiStreamEngine {
                         try ensureDirectory(parent, under: root, device: expectedDevice)
                         let archived = root.appendingPathComponent(relative)
                         try fm.moveItem(at: entry.destination, to: archived)
+                        relock(archived, olderFlags)
                         archivedCount += 1
                         do {
                             try fm.moveItem(at: temporary, to: entry.destination)
@@ -563,6 +743,7 @@ enum DigiStreamEngine {
                 } else {
                     try fm.moveItem(at: temporary, to: entry.destination)
                 }
+                relock(entry.destination, tempFlags)
                 state.finalizeSeconds += Date().timeIntervalSince(finalizeStarted)
                 temporaries.remove(temporary)
                 current.files[entry.relative] = "copied-size-date"
@@ -581,6 +762,30 @@ enum DigiStreamEngine {
                     largeCount += 1; largeBytes += entry.size; largeSeconds += staged.seconds
                 } else {
                     smallCount += 1; smallBytes += entry.size
+                }
+            }
+
+            // v1.29: commit a finished copy, unless the source changed under us
+            // between the copy and the commit; then skip it and keep going.
+            func commitOrSkip(_ staged: Staged) throws {
+                do { try commit(staged) }
+                catch is SourceChanged {
+                    removeTemp(staged.temporary)
+                    temporaries.remove(staged.temporary)
+                    inFlight.add(-staged.entry.size)
+                    state.totalFiles = max(0, state.totalFiles - 1)
+                    state.totalBytes = max(0, state.totalBytes - staged.entry.size)
+                    state.skippedFiles += 1
+                    skippedThisRun.append(staged.entry.relative)
+                } catch let problem as SourceProblem {
+                    // v1.37: can't be finished as it is; flag it, keep going.
+                    removeTemp(staged.temporary)
+                    temporaries.remove(staged.temporary)
+                    inFlight.add(-staged.entry.size)
+                    state.totalFiles = max(0, state.totalFiles - 1)
+                    state.totalBytes = max(0, state.totalBytes - staged.entry.size)
+                    state.problemFiles += 1
+                    problemsThisRun.append((problem.relative, problem.reason))
                 }
             }
 
@@ -604,9 +809,20 @@ enum DigiStreamEngine {
                         let counter = inFlight
                         let device = expectedDevice
                         let laneGate = gate
+                        let laneUncached = uncachedWrites
                         group.addTask(priority: .userInitiated) {
                             try checkDirectory(entry.destination.deletingLastPathComponent(), device: device)
-                            try checkSourceUnchanged(entry)
+                            // v1.29: a file still being written is skipped, not fatal.
+                            do { try checkSourceUnchanged(entry) }
+                            catch is SourceChanged {
+                                removeTemp(temporary)
+                                return .skipped(entry, lane)
+                            }
+                            // v1.37: an unreadable file is flagged and skipped, not fatal.
+                            if let reason = unreadableReason(entry.source) {
+                                removeTemp(temporary)
+                                return .problem(entry, lane, reason)
+                            }
                             if let attributes = try? FileManager().attributesOfItem(atPath: entry.destination.path),
                                attributes[.type] as? FileAttributeType != .typeRegular {
                                 throw failure("A directory or symbolic link blocks the destination: " + entry.relative)
@@ -619,7 +835,7 @@ enum DigiStreamEngine {
                                         // With read-back on, large files are checked in their own step (below).
                                         return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
                                                              control: laneControl, written: counter, verify: verify,
-                                                             readBack: false)
+                                                             readBack: false, uncached: laneUncached)
                                     }
                                     // v1.27: Full verify reads small files back in the pass after copying too.
                                     let value = try copySmall(source: entry.source, target: temporary, verify: verify,
@@ -637,7 +853,7 @@ enum DigiStreamEngine {
                                         return try copyOnce()
                                     } catch is ChecksumMismatch where attempt == 0 {
                                         attempt += 1
-                                        try? FileManager().removeItem(at: temporary)
+                                        removeTemp(temporary)
                                         if lane == .large { counter.add(-entry.size) }
                                     } catch is ChecksumMismatch {
                                         throw ChecksumMismatch(relative: entry.relative)
@@ -707,6 +923,23 @@ enum DigiStreamEngine {
                             switch result {
                             case .tick:
                                 tickActive = false
+                            case .skipped(let entry, let lane):
+                                // v1.29: source still being written. Keep totals honest
+                                // so the bar still reaches 100%, note it, move on.
+                                if lane == .large { largeActive -= 1 } else { smallActive -= 1 }
+                                state.totalFiles = max(0, state.totalFiles - 1)
+                                state.totalBytes = max(0, state.totalBytes - entry.size)
+                                state.skippedFiles += 1
+                                skippedThisRun.append(entry.relative)
+                                await publish()
+                            case .problem(let entry, let lane, let reason):
+                                // v1.37: flagged, not fatal. Keep totals honest so the bar reaches 100%.
+                                if lane == .large { largeActive -= 1 } else { smallActive -= 1 }
+                                state.totalFiles = max(0, state.totalFiles - 1)
+                                state.totalBytes = max(0, state.totalBytes - entry.size)
+                                state.problemFiles += 1
+                                problemsThisRun.append((entry.relative, reason))
+                                await publish()
                             case .staged(let staged):
                                 if staged.lane == .large { largeActive -= 1 } else { smallActive -= 1 }
                                 if staged.needsReadBack {
@@ -716,17 +949,17 @@ enum DigiStreamEngine {
                                 }
                                 // Never commit a finished copy after Stop.
                                 try await pauseIfNeeded()
-                                try commit(staged)
+                                try commitOrSkip(staged)
                                 await publish()
                             case .checked(let staged, let matched):
                                 checkActive -= 1
                                 if matched {
                                     try await pauseIfNeeded()
-                                    try commit(staged)
+                                    try commitOrSkip(staged)
                                     await publish()
                                 } else if staged.attempt == 0 {
                                     // One fresh copy before it counts as a failure.
-                                    try? fm.removeItem(at: staged.temporary)
+                                    removeTemp(staged.temporary)
                                     temporaries.remove(staged.temporary)
                                     inFlight.add(-staged.entry.size)
                                     admit(staged.entry, lane: .large, attempt: 1)
@@ -758,19 +991,24 @@ enum DigiStreamEngine {
                 temporaries.insert(temporary)
                 let repairControl = abort
                 let scratch = ByteCounter()
+                let repairUncached = uncachedWrites
                 let fresh: UInt64? = try await runBlocking { () throws -> UInt64? in
                     if entry.size >= largeFileThreshold {
                         return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
-                                             control: repairControl, written: scratch, verify: true, readBack: true)
+                                             control: repairControl, written: scratch, verify: true, readBack: true,
+                                             uncached: repairUncached)
                     }
                     return try copySmall(source: entry.source, target: temporary, verify: true, readBack: true, control: repairControl)
                 }
                 guard fresh == expected else { throw ChecksumMismatch(relative: entry.relative) }
                 try checkSourceUnchanged(entry)
                 try checkDirectory(entry.destination.deletingLastPathComponent(), device: expectedDevice)
+                let repairFlags: UInt32? = try unlockIfLocked(temporary)
+                _ = try unlockIfLocked(entry.destination)
                 try fm.setAttributes([.modificationDate: entry.modified], ofItemAtPath: temporary.path)
                 _ = try fm.replaceItemAt(entry.destination, withItemAt: temporary,
                                          backupItemName: nil, options: .usingNewMetadataOnly)
+                relock(entry.destination, repairFlags)
                 temporaries.remove(temporary)
                 state.repairedFiles += 1
             }
@@ -806,8 +1044,16 @@ enum DigiStreamEngine {
                         return try readOnce()
                     }
                     if !matched, let entry = byRelative[relative] {
-                        try await repair(entry, expected: expected)
-                        matched = true
+                        do {
+                            try await repair(entry, expected: expected)
+                            matched = true
+                        } catch is SourceChanged {
+                            // v1.29: the original is being written right now. Leave this
+                            // run's copy in place, note it, and let the next run redo it.
+                            state.skippedFiles += 1
+                            skippedThisRun.append(relative)
+                            continue
+                        }
                     }
                     guard matched else { throw ChecksumMismatch(relative: relative) }
                     state.verifiedFiles += 1
@@ -832,7 +1078,9 @@ enum DigiStreamEngine {
                     }
                     let target = archivePrefix + "/Removed from source/" + relative
                     try ensureDirectory((target as NSString).deletingLastPathComponent, under: root, device: expectedDevice)
+                    let removedFlags: UInt32? = try unlockIfLocked(old)
                     try fm.moveItem(at: old, to: root.appendingPathComponent(target))
+                    relock(root.appendingPathComponent(target), removedFlags)
                     removedThisRun.append(relative)
                     archivedCount += 1
                 }
@@ -850,7 +1098,7 @@ enum DigiStreamEngine {
         }
         copying = false
         // The task group has drained, so no copy is still writing these.
-        for temporary in temporaries { try? fm.removeItem(at: temporary) }
+        for temporary in temporaries { removeTemp(temporary) }
 
         // v1.25: checksum list and report on the drive, even after a stop or error,
         // so every file that was verified is on record.
@@ -861,7 +1109,8 @@ enum DigiStreamEngine {
                 unchangedFiles: state.unchangedFiles, sourceKeys: reportKeys,
                 copiedBytes: committedBytes, readBack: readBack,
                 readBackDone: postVerify ? state.verifiedFiles : 0, renamedPaths: renamedPaths,
-                archived: archivedCount, repaired: state.repairedFiles)
+                archived: archivedCount, repaired: state.repairedFiles, skipped: skippedThisRun,
+                problems: problemsThisRun)
             do {
                 state.reportPath = try DigiBackupReport.write(input)
             } catch {
@@ -880,6 +1129,7 @@ enum DigiStreamEngine {
             let smallText: String = ByteCountFormatter.string(fromByteCount: smallBytes, countStyle: .file)
             note += " · small files: \(smallCount), " + smallText
             note += String(format: " · copy time %.0fs", copyWall)
+            if !uncachedWrites { note += " · exFAT/FAT drive: cached writes" }
             if state.engineNote.isEmpty { state.engineNote = note } else { state.engineNote = note + " · " + state.engineNote }
         } else if state.engineNote.isEmpty {
             state.engineNote = displayName

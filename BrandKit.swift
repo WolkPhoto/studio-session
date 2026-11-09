@@ -44,6 +44,12 @@ struct DigiBackupSnapshot {
     var connectedCount: Int { drives.filter { $0.state != .disconnected }.count }
     var doneCount: Int { drives.filter { $0.state == .done }.count }
     var problemCount: Int { drives.filter { $0.state == .problem }.count }
+    /// v1.30: true once the run is reading copies back (every still-working drive
+    /// is in its verify pass), so the UI can say "Verifying" instead of "Copying".
+    var verifying: Bool {
+        let working = drives.filter { $0.state == .copying }
+        return !working.isEmpty && working.allSatisfy { $0.verifying }
+    }
 
     @MainActor static func from(_ model: WrapModel) -> DigiBackupSnapshot {
         var lines: [DigiDriveLine] = []
@@ -153,10 +159,17 @@ struct DigiNextStep {
                     detail: "Nothing is lost. Resume when you're ready.", button: "Resume", icon: "pause.circle")
             }
             let speed = Int(snapshot.mbps.rounded())
-            var detail = speed > 0 ? "Copying \(root.lastPathComponent) at \(speed) MB/s." : "Copying \(root.lastPathComponent)."
+            // v1.30: name the folder actually being backed up (the backup source),
+            // not whatever session Home happens to be showing.
+            let sourceName = (model.syncSource ?? root).lastPathComponent
+            // v1.30: say "Verifying" during the read-back pass so Home matches the
+            // Backups tab.
+            let verb = snapshot.verifying ? "Verifying" : "Copying"
+            let title = snapshot.verifying ? "Verifying: \(percent)%" : "Backing up: \(percent)%"
+            var detail = speed > 0 ? "\(verb) \(sourceName) at \(speed) MB/s." : "\(verb) \(sourceName)."
             let left = DigiBackupSnapshot.etaText(snapshot.eta)
             if !left.isEmpty { detail += " " + left.prefix(1).uppercased() + left.dropFirst() + "." }
-            return DigiNextStep(kind: .backingUp, title: "Backing up: \(percent)%",
+            return DigiNextStep(kind: .backingUp, title: title,
                 detail: detail, button: "Pause", icon: "pause.fill")
         }
         if model.backups.isEmpty {

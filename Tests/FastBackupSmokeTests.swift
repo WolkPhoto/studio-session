@@ -143,7 +143,9 @@ private final class Reports: @unchecked Sendable {
         let beforeStale = try Data(contentsOf: targetA)
         try put("Capture/A.iiq", "newer source after planning", modified: stamp.addingTimeInterval(30))
         let staleResult = await run(first, snapshot: stale)
-        try require(staleResult.errorCount == 1, "Source mutation was not detected")
+        // v1.29: a source that moved after planning (still being written) is now
+        // skipped, not fatal; the backup finishes and the old destination is kept.
+        try require(staleResult.errorCount == 0 && staleResult.skippedFiles == 1, "A source changed mid-backup should be skipped, not fatal")
         let afterStale = try Data(contentsOf: targetA)
         try require(beforeStale == afterStale, "Source mutation overwrote the old destination")
 

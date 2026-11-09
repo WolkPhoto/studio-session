@@ -44,6 +44,11 @@ struct SyncProgress: Identifiable, Sendable {
     var renamedFiles = 0
     /// v1.27: copies that failed their check and were copied again successfully.
     var repairedFiles = 0
+    /// v1.29: files still being written (size or date stamp moved mid-backup).
+    /// Skipped this run, not an error; the next run catches them.
+    var skippedFiles = 0
+    /// v1.37: files that couldn't be backed up as they are (unreadable / lock), skipped and flagged.
+    var problemFiles = 0
     /// v1.28: how long copying took, and the read-back pass, separately.
     var copyPhaseSeconds: Double = 0
     var verifyPhaseSeconds: Double = 0

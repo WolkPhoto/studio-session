@@ -1,13 +1,15 @@
 import SwiftUI
 
-// GRIP: a pro studio tool. Sidebar on the left with every tool and a live
-// backup panel that never goes away. Command-1 to Command-9 jump to tools.
-// The sidebar collapses to icons (Control-Command-S or the sidebar button).
+// STUDIO SESSION (code name GRIP): a pro studio tool. v1.29 moves navigation
+// from the old slide-out sidebar to tabs across the top (like Tally). The tools,
+// their order and the keyboard shortcuts (Command-1..8) are unchanged; only the
+// layout moved. The Backups tab carries a live status light, and a thin progress
+// strip appears under the tabs while a backup runs, so the backup is never out
+// of sight no matter which tool is open.
 
 struct GripShell<Content: View>: View {
     @ObservedObject var model: WrapModel
     let content: Content
-    @AppStorage("Grip.sidebarCollapsed") private var collapsed = false
     @AppStorage(DigiHiddenTools.key) private var hiddenRaw = ""
     @AppStorage(DigiToolOrder.key) private var orderRaw = ""
 
@@ -18,228 +20,133 @@ struct GripShell<Content: View>: View {
 
     private var t: DigiTheme { DigiBrand.theme }
     private var hidden: Set<Int> { DigiHiddenTools.parse(hiddenRaw) }
-
-    var body: some View {
-        mainArea
-            .background(t.background)
-        .frame(minHeight: 640)
-    }
-
-    private var mainArea: some View {
-        HStack(spacing: 0) {
-            sidebar
-                .padding(.top, DigiBrand.titleBarInset)
-                .frame(width: collapsed ? 72 : 236)
-                .background(t.surface)
-                .zIndex(1)
-            Rectangle().fill(t.line).frame(width: 1)
-            VStack(spacing: 0) {
-                header
-                Rectangle().fill(t.line).frame(height: 1)
-                if model.lastTab == 0 { homeHero }
-                content
-            }
-            .background(t.background)
-        }
-        .background(t.background)
-    }
-
-    private func toggleSidebar() {
-        withAnimation(.easeInOut(duration: 0.2)) { collapsed.toggle() }
-    }
-
-    // MARK: Sidebar
-
-    private var sidebarToggle: some View {
-        Button { toggleSidebar() } label: {
-            Image(systemName: "sidebar.left")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(t.subtext)
-                .frame(width: 30, height: 30)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .keyboardShortcut("s", modifiers: [.control, .command])
-        .help(collapsed ? "Show the full sidebar (Control-Command-S)" : "Collapse the sidebar to icons (Control-Command-S)")
-        .accessibilityLabel(collapsed ? "Expand sidebar" : "Collapse sidebar")
-    }
-
-    private var sidebar: some View {
-        VStack(alignment: collapsed ? .center : .leading, spacing: 0) {
-            if collapsed {
-                VStack(spacing: 6) {
-                    GripMark(size: 20)
-                    sidebarToggle
-                }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 8)
-                    .padding(.bottom, 8)
-            } else {
-                HStack(spacing: 8) {
-                    GripMark(size: 20)
-                    Text("STUDIO SESSION")
-                        .font(DigiBrand.display(13, .heavy))
-                        .foregroundStyle(t.text)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                    Spacer()
-                    sidebarToggle
-                }
-                .padding(.leading, 16)
-                .padding(.trailing, 10)
-                .padding(.top, 8)
-                .padding(.bottom, 8)
-            }
-
-            VStack(alignment: collapsed ? .center : .leading, spacing: 2) {
-                ForEach(Array(visibleList.enumerated()), id: \.element.id) { position, tool in
-                    toolRow(tool, position: position, count: visibleList.count)
-                }
-                if !collapsed {
-                    DigiShowHiddenButton()
-                        .padding(.top, 4)
-                }
-            }
-            .padding(.horizontal, 10)
-
-            Spacer(minLength: 12)
-            if collapsed {
-                collapsedBackupPanel
-                    .padding(.bottom, 14)
-            } else {
-                backupPanel
-                    .padding(10)
-            }
-        }
-    }
-
     private var visibleList: [DigiTool] { DigiBrand.visibleTools(hidden: hidden) }
 
-    private func toolRow(_ tool: DigiTool, position: Int, count: Int) -> some View {
-        let selected = model.lastTab == tool.id
-        let number = DigiBrand.shortcutNumber(tool.id, hidden: hidden)
-        var shortcut = ""
-        if let number { shortcut = "⌘" + String(number) }
-        var tip = tool.blurb
-        if collapsed {
-            tip = shortcut.isEmpty ? tool.name : tool.name + "  " + shortcut
+    var body: some View {
+        let snapshot = DigiBackupSnapshot.from(model)
+        return VStack(spacing: 0) {
+            brandStrip
+            tabStrip(snapshot)
+                .zIndex(1)
+            if snapshot.running {
+                runningStrip(snapshot)
+            }
+            Rectangle().fill(t.line).frame(height: 1)
+            header
+            Rectangle().fill(t.line).frame(height: 1)
+            if model.lastTab == 0 { homeHero }
+            content
         }
+        .background(t.background)
+        .frame(minHeight: 620)
+    }
+
+    // MARK: Brand line (sits on the window-button row, not clickable so the
+    // window still drags there and the traffic lights stay clear on the left).
+
+    private var brandStrip: some View {
+        HStack(spacing: 8) {
+            GripMark(size: 17)
+            Text("STUDIO SESSION")
+                .font(DigiBrand.display(13, .heavy))
+                .foregroundStyle(t.text)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: DigiBrand.titleBarInset)
+        .allowsHitTesting(false)
+    }
+
+    // MARK: Tabs
+
+    private func tabStrip(_ snapshot: DigiBackupSnapshot) -> some View {
+        HStack(spacing: 3) {
+            ForEach(Array(visibleList.enumerated()), id: \.element.id) { position, tool in
+                tabButton(tool, position: position, count: visibleList.count, snapshot: snapshot)
+            }
+            DigiAddToolMenu(model: model)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+    }
+
+    /// Green when the last backup was clean, amber while running, red on a
+    /// problem. Always visible on the Backups tab, from any tool.
+    private func backupLight(_ snapshot: DigiBackupSnapshot) -> Color {
+        if snapshot.running { return snapshot.paused ? t.warn : t.accent }
+        if snapshot.problemCount > 0 { return t.bad }
+        if snapshot.lastBackup != nil { return t.good }
+        return t.subtext
+    }
+
+    private func tabButton(_ tool: DigiTool, position: Int, count: Int, snapshot: DigiBackupSnapshot) -> some View {
+        let selected = model.lastTab == tool.id
+        // Two-word names stack onto two lines; single words stay on one.
+        let stacked = tool.name.replacingOccurrences(of: " ", with: "\n")
         return Button { model.lastTab = tool.id } label: {
-            HStack(spacing: 10) {
+            VStack(spacing: 4) {
                 Image(systemName: tool.icon)
-                    .font(.system(size: collapsed ? 17 : 14, weight: .semibold))
-                    .frame(width: 20)
-                if !collapsed {
-                    Text(tool.name)
-                        .font(DigiBrand.body(14, selected ? .semibold : .medium))
-                    if tool.id == 8 {
-                        Text("BETA").font(.system(size: 9, weight: .bold)).foregroundStyle(selected ? t.onAccent : t.warn)
-                    }
-                    Spacer()
-                    Text(shortcut)
-                        .font(DigiBrand.numbers(11, .medium))
-                        .foregroundStyle(selected ? t.onAccent.opacity(0.7) : t.subtext.opacity(0.7))
-                }
+                    .font(.system(size: 17, weight: .semibold))
+                Text(stacked)
+                    .font(DigiBrand.body(11, selected ? .semibold : .medium))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .foregroundStyle(selected ? t.onAccent : t.text)
-            .padding(.horizontal, 10)
-            .frame(maxWidth: collapsed ? 48 : .infinity, minHeight: collapsed ? 40 : 34)
-            .background(selected ? t.accent : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(minWidth: 70, maxWidth: .infinity, minHeight: 56)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 6)
+            .background(selected ? t.accent : Color.clear, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(alignment: .topTrailing) {
+                if tool.id == 1 {
+                    Circle()
+                        .fill(backupLight(snapshot))
+                        .frame(width: 7, height: 7)
+                        .overlay(Circle().strokeBorder(selected ? t.accent : t.surface, lineWidth: 1.5))
+                        .padding(7)
+                }
+            }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(tip)
+        .help(tool.blurb)
         .accessibilityLabel(tool.name)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .digiToolMenu(model, tool: tool.id)
-        .digiArrange(model, tool: tool.id, index: position, count: count, vertical: true)
+        .digiArrange(model, tool: tool.id, index: position, count: count)
     }
 
-    private var backupPanel: some View {
-        let snapshot = DigiBackupSnapshot.from(model)
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("BACKUPS")
-                    .font(DigiBrand.numbers(11, .semibold))
-                    .foregroundStyle(t.subtext)
-                Spacer()
-                if snapshot.running {
-                    Text("\(Int((snapshot.fraction * 100).rounded()))%")
-                        .font(DigiBrand.numbers(12, .semibold))
-                        .foregroundStyle(t.accent)
-                }
-            }
-            if snapshot.running {
-                DigiProgressBar(fraction: snapshot.fraction, height: 6)
+    /// A thin live progress strip under the tabs while a backup runs, so you can
+    /// watch it from any tool. Replaces the old always-on sidebar panel.
+    private func runningStrip(_ snapshot: DigiBackupSnapshot) -> some View {
+        VStack(spacing: 5) {
+            HStack(spacing: 10) {
+                Text(snapshot.verifying ? "Verifying" : "Backing up")
+                    .font(DigiBrand.body(11, .semibold))
+                    .foregroundStyle(t.accent)
                 let left = DigiBackupSnapshot.etaText(snapshot.eta)
                 if !left.isEmpty {
                     Text(left.prefix(1).uppercased() + left.dropFirst())
-                        .font(DigiBrand.body(11, .semibold))
+                        .font(DigiBrand.body(11))
                         .foregroundStyle(t.subtext)
+                        .lineLimit(1)
                 }
-            }
-            if snapshot.drives.isEmpty {
-                Text("No drives chosen yet.")
-                    .font(DigiBrand.body(12))
-                    .foregroundStyle(t.subtext)
-            }
-            ForEach(snapshot.drives) { line in
-                HStack(spacing: 8) {
-                    Image(systemName: digiStateIcon(line.state))
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(digiStateColor(line.state))
-                        .frame(width: 14)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(line.name).font(DigiBrand.body(12, .semibold)).foregroundStyle(t.text).lineLimit(1)
-                        Text(digiStateWord(line)).font(DigiBrand.body(11)).foregroundStyle(t.subtext).lineLimit(1)
-                    }
-                }
-            }
-            HStack(spacing: 6) {
-                DigiNextStepButton(model: model)
-                if model.syncBusy { DigiStopButton(model: model) }
-            }
-        }
-        .padding(12)
-        .background(t.raised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(snapshot.running ? t.accent.opacity(0.7) : t.line))
-    }
-
-    /// Collapsed: a status light, the percent while copying, and the next step as one icon.
-    private var collapsedBackupPanel: some View {
-        let snapshot = DigiBackupSnapshot.from(model)
-        let step = DigiNextStep.current(model)
-        var light: Color = t.subtext
-        if snapshot.running {
-            light = snapshot.paused ? t.warn : t.accent
-        } else if snapshot.problemCount > 0 {
-            light = t.bad
-        } else if snapshot.lastBackup != nil {
-            light = t.good
-        }
-        return VStack(spacing: 8) {
-            Circle().fill(light).frame(width: 10, height: 10)
-            if snapshot.running {
+                Spacer(minLength: 6)
                 Text("\(Int((snapshot.fraction * 100).rounded()))%")
                     .font(DigiBrand.numbers(11, .semibold))
-                    .foregroundStyle(t.text)
+                    .foregroundStyle(t.accent)
+                if model.syncBusy { DigiStopButton(model: model) }
             }
-            Button { step.perform(model) } label: {
-                Image(systemName: step.icon)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(t.onAccent)
-                    .frame(width: 44, height: 44)
-                    .background(t.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .disabled(model.driveCheckRunning)
-            .help(step.button + ": " + step.detail)
-            .accessibilityLabel(step.button)
+            DigiProgressBar(fraction: snapshot.fraction, height: 4)
         }
-        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
     }
 
-    // MARK: Header and Home
+    // MARK: Header and Home (unchanged behavior, now below the tabs)
 
     private var header: some View {
         HStack(alignment: .center, spacing: 14) {
@@ -256,7 +163,7 @@ struct GripShell<Content: View>: View {
             DigiSessionChip(model: model)
         }
         .padding(.horizontal, 24)
-        .padding(.top, 12)
+        .padding(.top, 10)
         .padding(.bottom, 10)
     }
 

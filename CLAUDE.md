@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.28.0 (folder `DigiFour_1_28`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.38.0 (folder `DigiFour_1_38`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -105,8 +105,9 @@ nearly full; compare engines on the same drive in the same state.
   files, without his explicit go-ahead. Destructive steps are his call.
 - Do not claim a speed improvement until it is measured; separate facts
   from guesses. No long test matrices; one fair comparison at most.
-- Every delivered version gets the exact Terminal build command for its
-  folder name, e.g. `cd "$HOME/Downloads/<Folder>" && bash build.command`.
+- Every delivered version gets THIS exact one-line build command (Jeff's standing request, Nov 9).
+  It refuses while the app runs, then unzips the newest DigiFour_*.zip in Downloads and builds:
+  `pgrep -f "Studio Session.app/Contents/MacOS" >/dev/null && echo "Quit Studio Session first (stop any backup), then run this again." || (cd ~/Downloads && Z=$(ls -t DigiFour_*.zip | head -1) && D=$(zipinfo -1 "$Z" | head -1 | cut -d/ -f1) && echo "Building $D from $Z" && unzip -o -q "$Z" && cd "$D" && bash build_all.command)`
 - Before switching versions: stop any backup, wait, quit the old app. Confirm
   the running build with
   `pgrep -fl "Digi Suite.app/Contents/MacOS/Digi Suite"`.
@@ -117,6 +118,8 @@ nearly full; compare engines on the same drive in the same state.
 - A button the user clicks must always visibly respond; if there is nothing to
   do, say why in a simple dialog that Return closes.
 - No em dashes in written replies.
+- GitHub (jsw513/studio-session): ask Jeff before every push. Day-to-day versions go out as zips
+  only; push when he says so (for example a release).
 - Keep SwiftUI body work cheap: never loop over scan results or file lists in a view body;
   cache totals when data changes (window resizes redraw constantly, see 20.10).
 
@@ -419,3 +422,242 @@ the lineup and build commands. 1.0 compiled clean on the first try (Nov 2, 7:28)
 - Check > "Check a Drive by Its Checksum List…" (DigiChecksumListCheck in DigiChecksum.swift, tested):
   reads every file in a backup's Checksums.xxh64 back from the drive, no session needed; alert with
   match / missing / different counts and Open Report; "<date> Drive Check.txt" in _StudioSession_Reports.
+
+### 1.29 (Nov 8; independent-check session)
+Background: Jeff ran independent checks (Apple's own diff -rq + cmp) on two Macs. Nov 5 LIG_GO
+(256 GB) and Nov 6 Foundayo_Stills both came back clean: only .DS_Store, the manifest, the archive
+and the reports folder differed, plus .cosessiondb (changes whenever Capture One is open). Empty
+folders ARE copied (inventory.directories). So the engine is trusted file-for-file; 1.29 is fixes
+and the top-tabs layout.
+
+- Skip busy files instead of aborting (DigiStreamEngine): a source file whose size or date stamp
+  moved mid-backup (Capture One / tether still writing it) was throwing and ending the WHOLE drive's
+  backup. This was the "a file and a date stamp" error Jeff hit, which also seemed to need a quit +
+  restart. Now checkSourceUnchanged throws a distinct `SourceChanged`; the copy lane, commit
+  (commitOrSkip) and the verify-pass repair all catch it and SKIP that one file, keep going, and keep
+  totals honest so the bar still reaches 100%. SyncProgress.skippedFiles; skippedThisRun -> report.
+  The safety is unchanged: a changing file is still never copied. Recheck tolerance now matches the
+  planner's 2 s (DigiStreamEngine.toleranceSkips, unit-tested). Drive card shows an amber "N files
+  were still being written and were skipped. Run Back Up again…"; counts line adds "N skipped";
+  report gets a "STILL BEING WRITTEN, SKIPPED THIS RUN" section with the list. New smoke test feeds a
+  stale snapshot so one file is guaranteed to skip. NOTE: "Up to date" status string is kept so the
+  done-logic (sound, auto-check, schedule result) still fires; skips are surfaced separately.
+- Clear report history (DigiBackupReport.reportInfo / clearReports in DigiChecksum): deletes only the
+  .txt reports in _StudioSession_Reports, never Checksums.xxh64 (incrementals + drive check need it).
+  Drive card: "Reports: N saved … · Clear History…" (NSAlert, Cancel default, destructive Clear).
+  WrapModel.reportInfo filled in the same detached pass as archiveInfo; confirmClearReports().
+- Job Report folder thumbnail from the Capture One PREVIEW, not the raw (Jeff: raws can be unexposed/
+  unedited). DigiCaptureOnePreview (in JobReport.swift): finds the sibling CaptureOne/Cache/Proxies
+  <rawname>*.cop (then Thumbnails *.cot), decodes via ImageIO, else scans for the embedded JPEG
+  (FFD8..FFD9). Falls back to the raw's embedded preview, so it's never worse than before. UNVERIFIED
+  on Jeff's Capture One 16.9 .cop format: if a thumbnail still looks like the flat raw, get a sample
+  .cop and tune the decoder.
+- Top tabs for Studio Session (ShellGrip rewritten): tabs across the top instead of the slide-out
+  sidebar (Jeff's request + approved mockup). Icon + two-word names stacked on two lines; NO shortcut
+  numbers on the tabs (Command-1..8 still work via the menu). Backups tab carries a live status light
+  (green/amber/red); a thin progress strip appears under the tabs while a backup runs, so the backup
+  is never out of sight (replaces the old always-on sidebar panel). digiArrange is now horizontal for
+  Grip; DigiAddToolMenu at the end adds hidden tools back. Sidebar collapse (Ctrl-Cmd-S) is gone.
+  DigiNavStyle.sidebar enum case kept (routing/marks unchanged). Tour navBody rewritten for tabs.
+- Studio Session tool names changed (Brand.swift BRAND_GRIP toolNames): Home, Backups, Selects Report,
+  Export Check, Folder Maker, Job Report, Contact Sheets, Folder Checker, Metadata(hidden). Indices and
+  Cmd-numbers unchanged; only display names.
+- No new Swift files; no build.command / test-list changes. Not compiled here (no Swift toolchain in
+  the cloud box); Jeff builds on his Mac. Build: cd "$HOME/Downloads/DigiFour_1_29" && bash build_all.command
+
+### 1.30 (Nov 8; found during the live skip stress test)
+Context: stress test on StressTest (218 GB, Full verify, hammered busy_big.dat). The big backup
+ran flawlessly and flat (~700 then ~590 MB/s once the T7 cache filled), top-tabs UI worked, but
+NO skip ever showed. Diagnosis: busy_big.dat was not on the T7 and skippedFiles was 0, i.e. the
+hammer created it a moment AFTER the backup's snapshot, so it was never in the plan. The fix was
+never exercised, not broken. BUT the investigation surfaced a real weakness, fixed here:
+- Tighter source-change detection (DigiStreamEngine.sourceMoved, was toleranceSkips): the pre-copy
+  check now treats ANY real change as a skip (size differs, or mtime differs by >1 ms), instead of
+  the 2 s window 1.29 used. The 2 s window let a file changing within 2 s of the snapshot slip
+  through on a quick backup, which is exactly the Capture One session-db case. The pre-copy check
+  compares the SAME file at two moments, so it should be near-exact; the 1 ms margin only absorbs
+  precision noise between contentModificationDate (snapshot) and .modificationDate (copy check).
+  Tests updated (near-exact cases). The planner's own 2 s tolerance (source vs last backup) is
+  unchanged and correct for its purpose.
+- Home "NEXT" card now says "Verifying: N%" / "Verifying <source>…" during the read-back pass
+  (matches the Backups tab), via DigiBackupSnapshot.verifying (all working drives in verify). It also
+  names the backup SOURCE (model.syncSource ?? root), not whatever session Home is showing (Jeff saw
+  "Copying testing" while backing up StressTest). Grip's top running-strip says "Verifying" too.
+- Clean skip test: start the hammer FIRST (busy_big.dat exists and is changing), THEN Start Backup,
+  so the file is in the snapshot. With 1.30's near-exact check it will skip even on a quick backup.
+- Not compiled here (no Swift toolchain); Jeff builds on his Mac.
+  Build: cd "$HOME/Downloads/DigiFour_1_30" && bash build_all.command
+
+### 1.31 (Nov 8)
+- Job Report thumbnail: REVERTED the 1.29 Capture One preview path. On Jeff's Capture One 16.9 the
+  .cop proxy decoded to black frames with a tiny sliver (the proxy is not a clean JPEG, and the bad
+  decode returned a non-nil CGImage so the raw fallback never fired). Back to the raw's embedded
+  preview (reliable 1.28 behavior). DigiCaptureOnePreview is left in JobReport.swift but UNUSED,
+  ready for a proper, validated decoder once a real .cop sample is analyzed. Rule for the rework:
+  only use the preview if it decodes to a sane image, else fall back to the raw.
+- Build: cd "$HOME/Downloads/DigiFour_1_31" && bash build_all.command
+
+### 1.32 (Nov 8; graded Job Report thumbnails via Output)
+Finding: Capture One 16.9 proxies (.cop) are progressive JPEG XL. macOS itself can't decode them
+(Finder Quick Look of the same bytes renamed .jxl shows the identical black-frame-with-sliver), so
+there is NO system route to the graded preview from the proxy. Dropped that idea for good; removed
+the dead DigiCaptureOnePreview enum from JobReport.swift.
+- Instead: Job Report folder thumbnail now PREFERS a graded JPEG from the session's Output folder,
+  matched by lowercased filename stem, and falls back to the raw's embedded preview when a frame
+  isn't exported yet. Jeff's QuickProof writes graded JPEGs (the 3840px preview, fast) into Output
+  with the SAME base name as the raw, so a normal shoot→cull→QuickProof→report gives graded thumbs
+  with zero extra steps and no JXL decoding. Index built once per report (proofByStem, walks
+  root/Output for jpg/jpeg/heic/heif/png/tif/tiff). Not in a view body, so the walk is fine.
+- Build: cd "$HOME/Downloads/DigiFour_1_32" && bash build_all.command
+
+### 1.33 (Nov 8; cable-pull test → notify loudly on failure)
+Cable-pull test (yanked T7 mid-backup): PASSED the safety half. Clean error on the .shootwrap-*.tmp
+TEMP (never a real file), backup stopped, no corruption. But it was SILENT (no popup, no Dock bounce),
+which Jeff rightly flagged. Found: notifyBackupResult already posted a UNUserNotification, but
+DigiSuite.backupNotifications defaults OFF and auth was only requested when the toggle was turned on,
+and there was no Dock bounce at all.
+- Fix: a failed/interrupted backup now ALWAYS bounces the Dock (NSApp.requestUserAttention(.criticalRequest))
+  and posts a notification, regardless of the toggle. A clean completion notifies only when the toggle
+  is on (so a 2-min schedule doesn't nag). Notification auth requested at launch (applicationDidFinishLaunching)
+  so the banner can show even when the user is in Capture One. Menu toggle relabeled "Notify When Backups
+  Succeed" with a help note that problems always alert.
+- Friendlier disconnect message (DigiStreamEngine.posixFailure): ENXIO/EIO/ENODEV → "“<drive>” was
+  disconnected during the backup. Reconnect it and run Back Up again." instead of raw "Device not configured".
+- Live drive watch (WrapModel.startDriveWatchIfNeeded): observes NSWorkspace didMount/didUnmount/didRenameVolume
+  to refreshDriveStatus, so a reconnected drive's card updates immediately instead of staying "Not connected"
+  from the failed run. Started from the dashboard onAppear.
+- Deduped a double `import UserNotifications`.
+- Recovery half of the cable-pull test (plug back in → Start Backup resumes incrementally; find no leftover
+  .shootwrap-*.tmp) still to be confirmed by Jeff.
+- Build: cd "$HOME/Downloads/DigiFour_1_33" && bash build_all.command
+
+### 1.34 (Nov 8; orphan temp sweep — found by the cable-pull test)
+The cable-pull test left an orphaned temp on the drive: find turned up
+/Volumes/WolkPhoto2TB/StressTest/Capture/.shootwrap-74977F72-...tmp (a different UUID than the one
+that errored, so 2+ small-file temps were in flight when the drive dropped). Later runs didn't clean
+it because each run only tracks its OWN temps. These temps are F_PREALLOCATE'd to full file size, so
+orphans waste real space over many interrupted backups. (Includes everything in 1.33; use 1.34, skip 1.33.)
+- Fix: DigiStreamEngine.removeOrphanTemps(in:) walks the destination and deletes any .shootwrap-*.tmp,
+  skipping the archive/reports subtrees (toolFolderNames). Called at the very start of
+  DigiStreamEngine.sync, where the caller already holds the destination lock, so no active run owns a
+  temp there (only pre-existing orphans are removed, never this run's). Enumerator does NOT skip hidden
+  files (temps are dot-prefixed). New smoke test: drop a fake .shootwrap-*.tmp, sweep, assert it's gone
+  and a real sibling + the archive are untouched.
+- Build: cd "$HOME/Downloads/DigiFour_1_34" && bash build_all.command
+
+### 1.35 (Nov 8; failure alert is now a must-click dialog)
+Jeff: a backup failure must be a modal dialog you acknowledge, NOT a top-right banner you can swipe
+away. Changed notifyBackupResult: on a problem it now shows a critical NSAlert (OK button) via
+DispatchQueue.main.async + runModal, plus the Dock bounce (so a backgrounded app pulls you to the
+waiting dialog). Guard `failureDialogShowing` stops a 2-min schedule from stacking dialogs (while one
+is up, later failures don't queue another; the async+runModal also serializes on the main queue).
+Deliberately does NOT NSApp.activate/steal focus, so a failure mid-tether in Capture One doesn't grab
+focus and risk a missed shot; the persistent Dock bounce brings the user over and the dialog waits.
+Success banner unchanged (opt-in "Notify When Backups Succeed").
+- Test: fail a backup while on the app → dialog appears, must click OK. Fail while in another app →
+  Dock bounces; clicking back shows the dialog.
+- Build: cd "$HOME/Downloads/DigiFour_1_35" && bash build_all.command
+
+### Nov 9 test day (1.35, jury duty; StudioSession_TestKit + engine probe)
+Kit: StudioSession_TestKit.zip (make_test_sets, make_test_drives, verify_backup = independent diff/stat check,
+tether_sim, hammer, churn, fill_drive). Test drives are disk images on WolkPhoto1TB_A (2 TB APFS):
+SSTest_APFS, SSTest_HFS, SSTest_Tiny, SSTest_XFAT (exFAT; volume names max 11 chars, hdiutil -fs ExFAT
+fails, made via diskutil eraseDisk). Capture One open for every test. Drives today: WolkPhoto1TB_A
+(2 TB) and WolkPhoto1TB_B (1 TB), both APFS, 10 Gb/s.
+- PASS: A1/A2 failure dialog + Dock bounce, Capture One keeps focus. A4 crash: orphan temp swept, 700/700 identical.
+- PASS: B shooting day. SSTest_Shoot 128.55 GB / 18,171 files to both drives at once: 6m35s (681 MB/s copy,
+  3m24s verify) and 7m06s (540 MB/s, 3m07s verify), Capture One open + fake tether. Scheduled 2-min runs
+  2-3 s each; .cosessiondb and busy_big.dat (same-size rewrite) skipped while busy, caught next run;
+  20 Capture One renames detected as renames. Final verify_backup PASS on both (18,465 files).
+- PASS (data) / FAIL (record-keeping): C1 yank during verify: rerun says "Up to date" with 173 files never
+  read back AND no Checksums.xxh64 written (report is written at the END of a run; drive gone; next run
+  has nothing new so writes nothing). C2/C3 Stop: rerun leaves unverified files too, but the list exists,
+  so Folder Checker > Check a Drive by Its Checksum List shows 700/700.
+- D1-D3 PASS with notes: hidden files are skipped by design (BackupFilter.includeHidden false; toggle in
+  each drive's settings); NFC accented names are stored as NFD on the backup (content identical, no recopy).
+- D4 FAIL -> fixed in 1.36 (below).
+- E2 PASS on 1.36: Big to WolkPhoto1TB_A (APFS) + real exFAT drive at once, exFAT cable pulled at ~33%:
+  A finished alone (verified), dialog "Partial: 1 up to date, 1 failed". After reconnect: exFAT copied
+  135, 565 unchanged (those 565 never read back: same as open item 1); verify_backup PASS on both
+  (700/700), no temps. Odd: exFAT yank shows the raw error ".shootwrap-....tmp couldn't be opened because
+  there is no such file" instead of the friendly "was disconnected" (posixFailure only maps ENXIO/EIO/
+  ENODEV; this one comes from FileManager/Cocoa). Odd: clicking to choose the exFAT drive (Use This Drive /
+  Add Folder... New Folder on exFAT) sometimes didn't register; not investigated.
+- D6 (1.36): symlink OK (not copied/followed). UNREADABLE file (chmod 000): whole backup fails, 0 of 2
+  copied ("Could not copy ...: Permission denied"). FINDER-LOCKED file (uchg): copyMetadata copies the
+  uchg flag onto the temp, setAttributes(mtime) then fails ("You don't have permission to save the file
+  .shootwrap-....tmp"), whole backup fails, and the locked temp is left behind; removeOrphanTemps can't
+  delete it, so one more locked temp piles up per run (2 after 2 runs).
+Open for 1.37+ (none built yet):
+0. DONE in 1.37: unreadable / Finder-locked source files no longer block the backup (see 1.37).
+1. Read-back/record after an interrupted run: write each checksum to the list as files commit (not at the
+   end), and have the next run finish any read-back the previous run didn't (C1/C2/C3).
+2. After a crash, the app forgets source/destinations and says nothing about the interrupted backup (A4).
+3. Failure dialog should name the drive and reason; no "needs attention" dialog for the person's own Stop;
+   "1 errors" plural; free space on the card doesn't refresh after a run.
+4. Report: a SKIPPED file is described as "copied before checksums were turned on" (and "1 files",
+   and "Compare > Deep Verify" should be Folder Checker).
+5. Archive keeps a full .cosessiondb (~27 MB) every run Capture One changes it; consider keeping fewer.
+6. Kit: tether_sim writes its log inside the session folder (move it out); verify_backup should ignore
+   .fseventsd/.Trashes when the backup is a volume root.
+
+### 1.36 (Nov 9; exFAT fix, found and isolated on test day)
+Symptom (D4): any backup to exFAT stopped on the first large file: "Copied size differs from the source".
+Isolated with an engine probe built from the real 1.35 engine files (app untouched) on SSTest_XFAT:
+- One large file alone: fine. Large file + the small-file lane writing into the same folder: the temp
+  reads back 0 bytes (copy=0). Needs F_NOCACHE + F_PREALLOCATE + concurrency together.
+- Removing only F_PREALLOCATE: right size, but full EdgeCases ended with WRONG CONTENTS in
+  16MiB_exact.bin and 8MiB_exact_RENAMED.bin (same size and date!). Full verify caught one; Quick or Off
+  would have been silent.
+- Removing only F_NOCACHE (cached writes): 2,065/2,065 copied and verified, verify_backup identical
+  (except the known hidden-file / NFD-name lines). Copying everything via copyfile also passed (slower).
+Fix: DigiStreamEngine.filesystemType(root) (statfs f_fstypename) once per backup; on "exfat" or "msdos"
+(prefersCachedWrites) copyLarge(uncached: false) skips F_NOCACHE (copy lane and repair). Space
+reservation, small-file lane, read-back (uncached reads) unchanged. APFS/HFS+ path byte-identical to 1.35.
+Engine note says "exFAT/FAT drive: cached writes". New smoke test (v1.36): the rule, the volume's
+filesystem type, and a cached-write copyLarge round trip.
+Confirmed Nov 9 on 1.36: SSTest_XFAT disk image (2,065 copied + verified, verify_backup clean) AND a real
+exFAT drive (WolkPhoto1TB_B erased as ExFAT "exfat", USB 10 Gb/s): EdgeCases 2,065 copied + verified,
+copy 6 s at 572 MB/s, verify 3 s, verify_backup clean (only hidden-file / NFD-name lines); second run
+0 copied / 2,065 unchanged (incrementals work on real exFAT). One run each;
+not a speed comparison.
+- Build: cd "$HOME/Downloads/DigiFour_1_36" && bash build_all.command
+
+### 1.37 (Nov 9; one odd file no longer blocks a backup; found in D6)
+Before: one unreadable file (no read permission) or one Finder-locked file (uchg) ended the WHOLE
+drive's backup, every run; the locked case also left an undeletable locked temp per run.
+- Unreadable: the copy lane checks access(R_OK) right after the busy check. Unreadable -> LaneResult
+  .problem(entry, lane, reason): skipped, totals adjusted, SyncProgress.problemFiles += 1, listed with
+  its reason. Never fatal.
+- Locked: copyfile copies uchg onto the temp. commit() now unlocks the temp (unlockIfLocked) before
+  setting the date and placing it, unlocks an existing locked backup copy before archiving/replacing
+  it, then relocks: the new backup copy gets the original's flags back (so it is locked like the
+  original), an archived older copy keeps its lock. Same unlock/relock in repair(), rename moves and
+  archive-removed moves. If a lock can't be cleared, the file becomes a SourceProblem (skipped +
+  flagged) instead of failing the run.
+- Temps: removeTemp() clears flags before deleting (all temp clean-up paths); removeOrphanTemps clears
+  flags too, so locked temps left by 1.36 and earlier are swept on the next run.
+- Card: red "N file(s) couldn't be backed up and are NOT on this drive (no permission to read, or
+  locked). Everything else is backed up. See the report..." and "N not backed up" in the counts line.
+  Status stays "Up to date" for what WAS backed up (done-logic, sounds and schedule unchanged); no
+  dialog for problem files (a 2-min schedule would re-alert every run). Open question for Jeff: alert?
+- Report: "Result: COMPLETE EXCEPT N FILES THAT COULDN'T BE BACKED UP" and a "COULDN'T BE BACKED UP"
+  section (file: reason, how to fix). Also fixed: skipped and problem files are no longer counted as
+  "copied before checksums were turned on" (open item 4); the line now says "Folder Checker > Deep
+  Verify" and pluralizes. Card: "1 error" (was "1 errors").
+- Smoke test (v1.37): unreadable file flagged + skipped while the rest copies, locked small + large
+  files backed up byte for byte and kept locked, changed locked original replaces + archives the
+  locked copy, locked orphan temp swept, report wording.
+Not compiled here (no Swift toolchain). Re-run D6 (Tricky B and C) on 1.37 to confirm in the app.
+- Build: cd "$HOME/Downloads/DigiFour_1_37" && bash build_all.command
+
+### 1.38 (Nov 9; smoke tests on GitHub's Macs)
+No app or engine changes (same code as 1.37). Adds .github/workflows/smoke-tests.yml: on every push
+(and by hand from the Actions tab) a GitHub-hosted macos-15 runner runs RUN_FAST_BACKUP_TESTS.command,
+so a version's smoke tests can pass before Jeff builds it. publish_github.command already copies the
+whole version folder (including .github) into ~/Developer/StudioSession and pushes, so pushing 1.38
+turns it on. Jeff is on GitHub Free: macOS minutes count 10x against 2,000/month (about 200 Mac
+minutes). Run time per push not measured yet; estimate 3-5 min. Without a payment method on file,
+usage simply stops at the quota. Still: ask Jeff before every push.
+Drive tests (yanks, exFAT hardware, Capture One) can't run there; those stay on Jeff's Mac.
+

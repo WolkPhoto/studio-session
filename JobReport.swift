@@ -2,6 +2,7 @@ import AppKit
 import PDFKit
 import ImageIO
 
+
 struct JobReportOptions {
     var fontName = "Helvetica"
     var images = true
@@ -38,6 +39,23 @@ enum DigiJobReport {
         }
         let folders: [JobFolder] = groups.keys.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.map { key in
             JobFolder(path: key, files: (groups[key] ?? []).sorted { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending })
+        }
+
+        // v1.32: graded folder thumbnails. QuickProof (and any export) writes
+        // graded JPEGs into the session's Output folder with the same base name
+        // as the raw. Index them once (by lowercased stem) so each folder's
+        // thumbnail can prefer the graded proof and fall back to the raw's own
+        // embedded preview when a frame hasn't been proofed yet. These are normal
+        // JPEGs, so nothing has to decode Capture One's JPEG XL proxies.
+        var proofByStem: [String: URL] = [:]
+        let proofExtensions: Set<String> = ["jpg","jpeg","heic","heif","png","tif","tiff"]
+        let outputFolder = root.appendingPathComponent("Output", isDirectory: true)
+        if let walker = FileManager.default.enumerator(at: outputFolder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+            for case let item as URL in walker {
+                guard proofExtensions.contains(item.pathExtension.lowercased()) else { continue }
+                let stem = item.deletingPathExtension().lastPathComponent.lowercased()
+                if proofByStem[stem] == nil { proofByStem[stem] = item }
+            }
         }
 
         // Editorial report layout: running page header/footer, metric tiles,
@@ -221,7 +239,13 @@ enum DigiJobReport {
                         var rendered = false
                         for candidate in order {
                             let file = folder.files[candidate].url
-                            guard let source = CGImageSourceCreateWithURL(file as CFURL, nil) else { continue }
+                            // v1.32: prefer the graded QuickProof JPEG from Output when
+                            // one exists (same base name); otherwise the raw's own
+                            // embedded preview. Capture One's JPEG XL proxies are not
+                            // decodable by macOS, so we never touch them.
+                            let stem = file.deletingPathExtension().lastPathComponent.lowercased()
+                            let imageURL = proofByStem[stem] ?? file
+                            guard let source = CGImageSourceCreateWithURL(imageURL as CFURL, nil) else { continue }
                             let properties: [CFString: Any] = [
                                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                                 kCGImageSourceThumbnailMaxPixelSize: 420,

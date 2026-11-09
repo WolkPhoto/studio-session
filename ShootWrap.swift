@@ -1,6 +1,5 @@
 import ServiceManagement
 import UserNotifications
-import UserNotifications
 import SwiftUI
 import AppKit
 import Foundation
@@ -306,13 +305,39 @@ struct ShootWrapProject: Codable {
         }
     }
     private func notifyBackupResult(_ status: String) {
+        let isProblem = !status.hasPrefix("Complete")
+        if isProblem {
+            // v1.35: a failed or interrupted backup is a big deal, so it gets a
+            // modal dialog the user must click through, not a banner that can be
+            // swiped away. Bounce the Dock too, so an app in the background pulls
+            // the user over to the waiting dialog. A guard stops a run-every-few-
+            // minutes schedule from stacking dialogs: while one is up, later
+            // failures don't queue another.
+            NSApp.requestUserAttention(.criticalRequest)
+            guard !failureDialogShowing else { return }
+            failureDialogShowing = true
+            let message = status
+            let name = DigiBrand.name
+            DispatchQueue.main.async { [weak self] in
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = name + ": a backup needs attention"
+                alert.informativeText = message + "\n\nOpen the Backups tab to see which drive, then run Back Up again."
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                self?.failureDialogShowing = false
+            }
+            return
+        }
+        // A clean completion stays quiet unless the user opted into success pings.
         guard backupNotificationsEnabled else { return }
         let content = UNMutableNotificationContent()
-        content.title = status.hasPrefix("Complete") ? "\(DigiBrand.name) backup complete" : "\(DigiBrand.name) backup needs attention"
+        content.title = "\(DigiBrand.name): backup complete"
         content.body = status
-        if !status.hasPrefix("Complete") { content.sound = .default }
+        content.sound = .default
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
+    private var failureDialogShowing = false
     @Published var scheduleLastRun: Date?
     @Published var scheduleLastResults: [String: String] = [:]
     @Published var scheduleStatus = "Automatic backups are off"
@@ -511,6 +536,22 @@ struct ShootWrapProject: Codable {
     func destinationIsPaused(_ path: String) -> Bool {
         syncBusy && (syncPaused || pausedDestinations.contains(path)) && !stoppingDestinations.contains(path)
     }
+    /// v1.33: watch for drives mounting and unmounting so the destination cards
+    /// reflect a reconnect right away, instead of being stuck on "Not connected"
+    /// from the last failed run until the next action.
+    private var driveWatchStarted = false
+    func startDriveWatchIfNeeded() {
+        guard !driveWatchStarted else { return }
+        driveWatchStarted = true
+        let center = NSWorkspace.shared.notificationCenter
+        let names = [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification]
+        for name in names {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshDriveStatus() }
+            }
+        }
+    }
+
     /// Reads link speed, free space and format for every destination.
     func refreshDriveStatus() {
         let destinations = backups
@@ -644,6 +685,8 @@ struct ShootWrapProject: Codable {
     /// v1.25: archive size per backup folder (path -> info), measured off the main thread.
     @Published var archiveInfo: [String: DigiArchive.Info] = [:]
     @Published var archiveMeasuring: Set<String> = []
+    /// v1.29: saved .txt reports per backup folder (path -> info).
+    @Published var reportInfo: [String: DigiBackupReport.ReportInfo] = [:]
 
     func refreshArchiveInfo() {
         for destination in backups {
@@ -652,10 +695,45 @@ struct ShootWrapProject: Codable {
             archiveMeasuring.insert(path)
             Task.detached(priority: .utility) {
                 let info = DigiArchive.measure(destination)
+                let reports = DigiBackupReport.reportInfo(destination)
                 await MainActor.run {
                     self.archiveInfo[path] = info
+                    self.reportInfo[path] = reports
                     self.archiveMeasuring.remove(path)
                 }
+            }
+        }
+    }
+
+    /// Asks first (Cancel is the default button), then deletes only the saved
+    /// .txt reports on that drive. The checksum list and the backup are untouched.
+    func confirmClearReports(_ destination: URL) {
+        let info = reportInfo[destination.path] ?? DigiBackupReport.ReportInfo()
+        guard !info.isEmpty else { return }
+        let size = ByteCountFormatter.string(fromByteCount: info.bytes, countStyle: .file)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Clear saved reports on " + destination.lastPathComponent + "?"
+        let reportWord = info.count == 1 ? "report" : "reports"
+        alert.informativeText = "This deletes \(info.count) saved \(reportWord) (" + size + ") in " + DigiFastBackupEngine.reportsName + ". The checksum list and your backup aren't touched, so drive checks still work.\n\nThis can't be undone."
+        alert.addButton(withTitle: "Cancel")
+        let delete = alert.addButton(withTitle: "Clear Reports")
+        delete.hasDestructiveAction = true
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        archiveMeasuring.insert(destination.path)
+        Task.detached(priority: .userInitiated) {
+            var problem: String?
+            do { try DigiBackupReport.clearReports(destination) } catch { problem = error.localizedDescription }
+            let failure = problem
+            await MainActor.run {
+                self.archiveMeasuring.remove(destination.path)
+                if let failure {
+                    let notice = NSAlert()
+                    notice.messageText = "Couldn't clear the reports"
+                    notice.informativeText = failure
+                    notice.runModal()
+                }
+                self.refreshArchiveInfo()
             }
         }
     }
@@ -2326,7 +2404,7 @@ struct ShootWrapView: View {
     private var toolContent: some View {
         ZStack {
                 FolderCompareView(sessionRoot: model.root, backupDestinations: model.backups, isActive: model.lastTab == 7, autoRefreshAllowed: !model.syncBusy)
-                    .onAppear { syncDashboardSource(); model.startBackupSchedulerIfNeeded() }
+                    .onAppear { syncDashboardSource(); model.startBackupSchedulerIfNeeded(); model.startDriveWatchIfNeeded() }
                     .onChange(of: model.root) { _ in syncDashboardSource(); model.refreshDashboardForSessionChange() }
                     .onChange(of: model.syncBusy) { busy in
                         if !busy { model.resumeDeferredDashboardScan() }
@@ -3028,6 +3106,7 @@ struct ShootWrapView: View {
                     destinationProgressBody(progress)
                 }
                 archiveLine(backup, copying: driveIsCopying(backup))
+                reportsLine(backup, copying: driveIsCopying(backup))
             }
         }
     }
@@ -3057,6 +3136,27 @@ struct ShootWrapView: View {
                 Text("Measuring the archive…")
             }
             .font(.caption).foregroundStyle(.tertiary)
+        }
+    }
+
+    // v1.29: saved run reports on this drive, with a way to clear their history.
+    @ViewBuilder private func reportsLine(_ backup: URL, copying: Bool) -> some View {
+        if let info = model.reportInfo[backup.path], !info.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "doc.on.doc").foregroundStyle(.secondary)
+                Text("Reports: \(info.count) saved " + (info.count == 1 ? "report" : "reports") + " · " + bytes(info.bytes))
+                    .lineLimit(1)
+                    .help("Saved backup and drive-check reports in " + DigiFastBackupEngine.reportsName + " on this drive. The checksum list is kept separately and is never cleared.")
+                Spacer(minLength: 4)
+                if model.archiveMeasuring.contains(backup.path) {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Clear History…") { model.confirmClearReports(backup) }
+                        .disabled(copying)
+                        .help("Delete the saved report files on this drive. The checksum list stays, so drive checks still work. You'll be asked to confirm.")
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -3140,6 +3240,8 @@ struct ShootWrapView: View {
         }
         if progress.renamedFiles > 0 { parts.append("\(progress.renamedFiles.formatted()) renamed") }
         if progress.repairedFiles > 0 { parts.append("\(progress.repairedFiles.formatted()) re-copied") }
+        if progress.skippedFiles > 0 { parts.append("\(progress.skippedFiles.formatted()) skipped") }
+        if progress.problemFiles > 0 { parts.append("\(progress.problemFiles.formatted()) not backed up") }
         parts.append("\(progress.unchangedFiles.formatted()) unchanged")
         return parts.joined(separator: " · ")
     }
@@ -3201,7 +3303,22 @@ struct ShootWrapView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         if progress.errorCount > 0 {
-            Text("\(progress.errorCount) errors").font(.caption2).foregroundStyle(.orange)
+            Text(progress.errorCount == 1 ? "1 error" : "\(progress.errorCount) errors").font(.caption2).foregroundStyle(.orange)
+        }
+        if progress.skippedFiles > 0 {
+            Label("\(progress.skippedFiles.formatted()) \(progress.skippedFiles == 1 ? "file was" : "files were") still being written and \(progress.skippedFiles == 1 ? "was" : "were") skipped. Run Back Up again to catch \(progress.skippedFiles == 1 ? "it" : "them"). See the report for the list.", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // v1.37: files that couldn't be backed up as they are. Unlike busy files, these won't
+        // fix themselves on the next run, so the message is red and says what to do.
+        if progress.problemFiles > 0 {
+            let one: Bool = progress.problemFiles == 1
+            let count: String = progress.problemFiles.formatted()
+            let what: String = one ? "file couldn't be backed up and is NOT on this drive" : "files couldn't be backed up and are NOT on this drive"
+            Label(count + " " + what + " (no permission to read, or locked). Everything else is backed up. See the report for which and how to fix.", systemImage: "xmark.octagon.fill")
+                .font(.caption).foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
         }
         if !progress.archiveNote.isEmpty {
             Text(progress.archiveNote).font(.caption).foregroundStyle(.secondary)
@@ -4156,7 +4273,8 @@ private struct DigiMenuBarView: View {
             Divider()
             Button("Backup Schedule…") { showApp(tab: 1) }
             Toggle("Scheduled Backups", isOn: $model.scheduleEnabled)
-            Toggle("Backup Notifications", isOn: $model.backupNotificationsEnabled)
+            Toggle("Notify When Backups Succeed", isOn: $model.backupNotificationsEnabled)
+                .help("A problem always bounces the Dock and posts a notification. Turn this on to also be notified when a backup finishes cleanly.")
             Toggle("Sounds", isOn: $sounds)
             Divider()
             Button("Open \(DigiBrand.name)") { showApp() }
@@ -4194,6 +4312,10 @@ private struct DigiMenuBarView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             MainActor.assumeIsolated { DigiInstaller.offerAtLaunch() }
         }
+        // v1.33: ask for notification permission up front so a failed or
+        // interrupted backup can alert the user even when they're in another app.
+        // The Dock bounce works regardless, so this is just for the banner.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let active = DigiBackupQuitRegistry.shared.activeBackups
