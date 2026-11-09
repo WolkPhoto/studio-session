@@ -411,6 +411,148 @@ enum StreamEngineSmokeTests {
         try check(sweptLocked == 1 && !fm.fileExists(atPath: lockedOrphan.path), "A locked orphan temp was not swept")
         print("PASS (v1.37): unreadable file flagged + skipped, locked files backed up and kept locked, locked temps swept")
 
+        // v1.39: a backup that stops (or loses its drive) before reading copies back leaves a
+        // record, and the next backup reads those copies back first (Nov 9, C1-C3).
+        let earlySource = fixture.appendingPathComponent("EarlySource", isDirectory: true)
+        let earlyTarget = fixture.appendingPathComponent("EarlyTarget", isDirectory: true)
+        for folder in [earlySource, earlyTarget] { try fm.createDirectory(at: folder, withIntermediateDirectories: true) }
+        let earlyFiles: [String: Data] = [
+            "a.txt": Data("alpha".utf8),
+            "b.txt": Data("bravo".utf8),
+            "sub/d.txt": Data("delta".utf8),
+            "c.bin": Data(repeating: 3, count: 9 * 1024 * 1024)   // large lane
+        ]
+        for (relative, data) in earlyFiles {
+            let url = earlySource.appendingPathComponent(relative)
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url)
+            try fm.setAttributes([.modificationDate: stamp], ofItemAtPath: url.path)
+        }
+        let earlyReports = earlyTarget.appendingPathComponent(DigiFastBackupEngine.reportsName)
+        let pendingList = earlyReports.appendingPathComponent(DigiBackupReport.pendingFileName)
+        let runMarker = earlyReports.appendingPathComponent(DigiBackupReport.runMarkerName)
+        func earlyRun(readBack: Bool = true, stopAtVerify: Bool = false) async -> SyncProgress {
+            let control = BackupControl()
+            return await DigiStreamEngine.sync(source: earlySource, destination: earlyTarget, archiveChanged: true, archiveRemoved: true,
+                filter: BackupFilter(), control: control, verify: true, readBack: readBack,
+                report: { state in if stopAtVerify && state.verifyPhase { control.stop() } })
+        }
+        func damage(_ relative: String) throws {
+            // Same size and date stamp, different bytes: only a read-back can tell.
+            let url = earlyTarget.appendingPathComponent(relative)
+            let size: Int = try Data(contentsOf: url).count
+            try Data(repeating: 0x58, count: size).write(to: url)
+            try fm.setAttributes([.modificationDate: stamp], ofItemAtPath: url.path)
+        }
+        func sourceHash(_ relative: String) throws -> UInt64 {
+            try DigiChecksum.hashFile(earlySource.appendingPathComponent(relative), uncached: false)
+        }
+        func sameAsSource(_ relative: String) throws -> Bool {
+            let copy = try Data(contentsOf: earlyTarget.appendingPathComponent(relative))
+            let original = try Data(contentsOf: earlySource.appendingPathComponent(relative))
+            return copy == original
+        }
+        // The pending list is appended line by line and reads back as a normal list.
+        let journalURL = fixture.appendingPathComponent("journal.xxh64")
+        let journalTest = DigiBackupReport.PendingJournal(url: journalURL)
+        journalTest.append("x/one.txt", 1)
+        journalTest.append("two.txt", 0xABCDEF)
+        journalTest.close()
+        let journalRead = DigiBackupReport.readChecksums(journalURL)
+        try check(journalRead["x/one.txt"] == XXHash64.hex(1) && journalRead["two.txt"] == XXHash64.hex(0xABCDEF), "Pending list lines didn't read back")
+        // 1. Stopped at the start of the read-back pass: copies are on the drive, on record, unverified.
+        let stopRun = await earlyRun(stopAtVerify: true)
+        try check(stopRun.status.hasPrefix("Stopped"), "Stop at read-back was ignored: " + stopRun.status)
+        try check(stopRun.completedFiles == 4 && stopRun.verifiedFiles == 0, "Expected 4 copied, 0 verified before the stop")
+        try check(stopRun.pendingReadBack == 4, "Expected 4 copies waiting to be read back, got \(stopRun.pendingReadBack)")
+        let pendingAfterStop = DigiBackupReport.readChecksums(pendingList)
+        try check(pendingAfterStop.count == 4, "Pending list should hold the 4 unverified copies")
+        for relative in earlyFiles.keys {
+            let expectedHex: String = try XXHash64.hex(sourceHash(relative))
+            try check(pendingAfterStop[relative] == expectedHex, "Pending checksum is wrong: " + relative)
+        }
+        try check(!fm.fileExists(atPath: runMarker.path), "Run marker left after a clean stop")
+        // 2. The next run copies nothing new but reads those 4 back, and says so.
+        let caughtUp = await earlyRun()
+        try check(caughtUp.status == DigiFastBackupEngine.completeStatus, "Catch-up run failed: " + caughtUp.status)
+        try check(caughtUp.completedFiles == 0 && caughtUp.earlierVerified == 4, "Expected 4 earlier copies read back, got \(caughtUp.earlierVerified)")
+        try check(caughtUp.pendingReadBack == 0 && !fm.fileExists(atPath: pendingList.path), "Pending list should be gone once everything is read back")
+        try check(!caughtUp.reportPath.isEmpty, "Catch-up run wrote no report")
+        let caughtUpReport = try String(contentsOfFile: caughtUp.reportPath, encoding: .utf8)
+        try check(caughtUpReport.contains("read back and verified this run"), "Report doesn't mention the earlier copies it verified")
+        let quiet = await earlyRun()
+        try check(quiet.earlierVerified == 0 && quiet.reportPath.isEmpty, "A run with nothing to do read back again or wrote a report")
+        // 3. A pending copy that went bad on the drive is copied again and checked.
+        try DigiBackupReport.writePending(["b.txt": try sourceHash("b.txt")], to: pendingList)
+        try damage("b.txt")
+        let repairedRun = await earlyRun()
+        try check(repairedRun.status == DigiFastBackupEngine.completeStatus, "Repairing an earlier copy failed: " + repairedRun.status)
+        try check(repairedRun.repairedFiles == 1 && repairedRun.earlierVerified == 1, "Bad earlier copy wasn't re-copied")
+        let bFixed: Bool = try sameAsSource("b.txt")
+        try check(bFixed, "Re-copied earlier file differs from the source")
+        // 4. A yanked drive can lose the last pending lines; the run marker catches what the
+        //    unfinished run placed (APFS / HFS+ only, by status-change time).
+        let fixtureType: String = DigiStreamEngine.filesystemType(earlyTarget)
+        if fixtureType == "apfs" || fixtureType == "hfs" {
+            try DigiBackupReport.writeRunMarker(runMarker, started: Date().addingTimeInterval(-5))
+            try damage("a.txt")
+            let adopted = await earlyRun()
+            try check(adopted.status == DigiFastBackupEngine.completeStatus, "Run after an unfinished run failed: " + adopted.status)
+            try check(adopted.repairedFiles >= 1 && adopted.earlierVerified >= 1, "Files placed by the unfinished run weren't checked")
+            let aFixed: Bool = try sameAsSource("a.txt")
+            try check(aFixed, "File placed by the unfinished run wasn't fixed")
+            try check(!fm.fileExists(atPath: runMarker.path), "Run marker should be cleared once everything is checked")
+        }
+        // 5. Quick never reads back, so earlier copies stay pending until a Full run.
+        try DigiBackupReport.writePending(["c.bin": try sourceHash("c.bin")], to: pendingList)
+        let quickKeeps = await earlyRun(readBack: false)
+        try check(quickKeeps.pendingReadBack == 1 && fm.fileExists(atPath: pendingList.path), "Quick run dropped a copy that still needs reading back")
+        let fullAfterQuick = await earlyRun()
+        try check(fullAfterQuick.earlierVerified == 1 && !fm.fileExists(atPath: pendingList.path), "Full run didn't read back what Quick left")
+        // 6. A pending record for a file that changed since is dropped; the new copy is checked as usual.
+        try DigiBackupReport.writePending(["sub/d.txt": 0], to: pendingList)
+        let changedURL = earlySource.appendingPathComponent("sub/d.txt")
+        try Data("delta v2".utf8).write(to: changedURL)
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_900)], ofItemAtPath: changedURL.path)
+        let superseded = await earlyRun()
+        try check(superseded.status == DigiFastBackupEngine.completeStatus, "Stale pending record broke the backup: " + superseded.status)
+        try check(superseded.completedFiles == 1 && superseded.verifiedFiles == 1 && superseded.earlierVerified == 0, "Changed file wasn't copied and verified normally")
+        try check(!fm.fileExists(atPath: pendingList.path), "Stale pending record wasn't dropped")
+        let earlyList = DigiBackupReport.readChecksums(earlyReports.appendingPathComponent(DigiBackupReport.checksumFileName))
+        for relative in earlyFiles.keys {
+            let expectedHex: String = try XXHash64.hex(sourceHash(relative))
+            try check(earlyList[relative] == expectedHex, "Checksum list is wrong after catch-up runs: " + relative)
+        }
+        print("PASS (v1.39): stopped read-back is recorded and finished next run; bad earlier copies re-copied; unfinished-run marker (\(fixtureType)); Quick keeps pending; stale records dropped")
+
+        // v1.40: a backup folder that already holds a backup of a different folder is caught
+        // before a manual backup (Nov 9: Tricky backed up into Big_C1 by mistake).
+        try check(DigiFastBackupEngine.otherSourceName(source: earlySource, destination: earlyTarget) == nil, "Same source flagged as a different folder")
+        let otherForProblem: String? = DigiFastBackupEngine.otherSourceName(source: problemSource, destination: earlyTarget)
+        try check(otherForProblem == "EarlySource", "Different source not caught by name: \(otherForProblem ?? "nil")")
+        let emptyFolder = fixture.appendingPathComponent("EmptyBackupFolder", isDirectory: true)
+        try fm.createDirectory(at: emptyFolder, withIntermediateDirectories: true)
+        try check(DigiFastBackupEngine.otherSourceName(source: earlySource, destination: emptyFolder) == nil, "A new, empty folder was flagged")
+        // Backups made before 1.40 have no name on record: the session database name decides,
+        // or nothing in common at the top level.
+        let oldBackup = fixture.appendingPathComponent("OldBackup", isDirectory: true)
+        try fm.createDirectory(at: oldBackup, withIntermediateDirectories: true)
+        var oldRecord = SyncRecord()
+        oldRecord.files = ["Capture/a.IIQ": "copied-size-date", "Shoot_A.cosessiondb": "copied-size-date"]
+        try JSONEncoder().encode(oldRecord).write(to: oldBackup.appendingPathComponent(DigiFastBackupEngine.manifestName))
+        let sessionB = fixture.appendingPathComponent("Shoot_B", isDirectory: true)
+        try fm.createDirectory(at: sessionB.appendingPathComponent("Capture"), withIntermediateDirectories: true)
+        try Data("db".utf8).write(to: sessionB.appendingPathComponent("Shoot_B.cosessiondb"))
+        let otherSession: String? = DigiFastBackupEngine.otherSourceName(source: sessionB, destination: oldBackup)
+        try check(otherSession == "Shoot_A", "Older backup of another session not caught: \(otherSession ?? "nil")")
+        let sessionA = fixture.appendingPathComponent("Shoot_A_renamed", isDirectory: true)
+        try fm.createDirectory(at: sessionA.appendingPathComponent("Capture"), withIntermediateDirectories: true)
+        try Data("db".utf8).write(to: sessionA.appendingPathComponent("Shoot_A.cosessiondb"))
+        try check(DigiFastBackupEngine.otherSourceName(source: sessionA, destination: oldBackup) == nil, "Same session (database name) in a renamed folder was flagged")
+        let unrelated: String? = DigiFastBackupEngine.otherSourceName(source: problemSource, destination: oldBackup)
+        try check(unrelated == "", "Older backup with nothing in common not caught")
+        print("PASS (v1.40): wrong-folder check (name on record, older backups by session database or nothing in common)")
+
         print("PASS (v17): Digi Stream bytes, dates, permissions, extended attributes, empty folders, incrementals, archives, space check, mid-file and paused stop")
     }
 }

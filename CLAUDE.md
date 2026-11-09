@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.38.0 (folder `DigiFour_1_38`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.40.0 (folder `DigiFour_1_40`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -590,8 +590,7 @@ fails, made via diskutil eraseDisk). Capture One open for every test. Drives tod
   delete it, so one more locked temp piles up per run (2 after 2 runs).
 Open for 1.37+ (none built yet):
 0. DONE in 1.37: unreadable / Finder-locked source files no longer block the backup (see 1.37).
-1. Read-back/record after an interrupted run: write each checksum to the list as files commit (not at the
-   end), and have the next run finish any read-back the previous run didn't (C1/C2/C3).
+1. DONE in 1.39: read-back/record after an interrupted run (C1/C2/C3), see 1.39.
 2. After a crash, the app forgets source/destinations and says nothing about the interrupted backup (A4).
 3. Failure dialog should name the drive and reason; no "needs attention" dialog for the person's own Stop;
    "1 errors" plural; free space on the card doesn't refresh after a run.
@@ -661,3 +660,76 @@ minutes). Run time per push not measured yet; estimate 3-5 min. Without a paymen
 usage simply stops at the quota. Still: ask Jeff before every push.
 Drive tests (yanks, exFAT hardware, Capture One) can't run there; those stay on Jeff's Mac.
 
+
+### 1.39 (Nov 9; nothing copied goes unchecked after a Stop, yank or crash; found C1-C3)
+Before: a Stop or a yanked drive during the read-back pass left copies that were never read back, and
+the next run said "Up to date" without checking them; after a yank no Checksums.xxh64 was written at
+all (the list and report are written at the END of a run). Data was always right; the record wasn't.
+- Pending list `_StudioSession_Reports/.StudioSession-ReadBackPending.xxh64` (xxhsum format, hidden,
+  never counted or cleared as a report). DigiBackupReport.PendingJournal appends "<hash>  <path>" as
+  each checksummed copy commits (fsync at most every 0.5 s). At the end of a run it's rewritten
+  (writePending, atomic) to what still needs reading back: with Full, earlier + this run's copies
+  minus those read back OK; Quick/Off keep only earlier records (Quick never reads back). Empty =
+  file removed. Earlier records for files being copied or renamed this run are dropped (superseded).
+- Run marker `.StudioSession-BackupRunning` (start time) while a checksummed run is going; removed
+  once the report/list and pending list are saved. Still there at the next run = that run never
+  finished: on APFS/HFS+ every file whose status-change time (lstat st_ctime) is after the marker,
+  minus files already pending or being copied, is "adopted": original hashed, copy read back. This
+  covers pending lines a yank lost in the last half second. exFAT/FAT: skipped (ctime not reliable
+  there); the pending list alone covers it, minus that last moment.
+- Next run, Full: earlier copies are read back FIRST in the verify pass ("Verifying 3 of 180: x
+  (left from an earlier backup)"), even when nothing new needs copying. Mismatch -> repair(expected:
+  nil): fresh copy checked against the original as it is now. Quick: adopted files get the original's
+  checksum recorded; pending stays until a Full run.
+- repair() now takes expected: UInt64? and returns the fresh checksum. Verify pass forces a publish
+  right after it starts ("Verifying copies…").
+- SyncProgress: extraReadBytes (bar/ETA: workBytes = total x 2 + extra), earlierVerified,
+  pendingReadBack, workBytes/workDoneBytes (UI bar, overall bar, snapshot use these now).
+- Card: counts line "N earlier verified"; orange line when pendingReadBack > 0 and nothing is
+  running: "N copies on this drive haven't been read back yet (the backup was stopped or
+  interrupted). The next backup reads them back first." Status string unchanged (done-logic).
+- Report: lines for earlier copies verified / recorded, "Still waiting to be read back: N",
+  result "COMPLETE, but N files still waiting to be read back" when that applies. DigiBackupReport.write
+  merges earlier checksums into the list and now reads the list before its "nothing new" early return.
+- Smoke test (v1.39): journal lines read back; Stop at the read-back pass leaves 4 pending with the
+  right checksums and no marker; next run reads 4 back, says so, pending gone; quiet run after that;
+  damaged pending copy re-copied; marker + damaged file (APFS) adopted and fixed, marker cleared;
+  Quick keeps pending, Full clears it; stale pending record for a changed file dropped; list correct.
+Not compiled here (no Swift toolchain). Real check on Jeff's Mac: C1 again (yank during Verifying,
+reconnect, Back Up: it should read back the leftovers and say "N earlier verified"), and C2 (Stop
+during Verifying, Back Up again).
+- Build: the standard one-liner (Working with Jeff).
+- 1.39.1: test compile fix only (the v1.39 test reused the name `stopped`, already a BackupControl in the same test). No app or engine changes.
+- 1.39.1 built and C2 PASSED on Jeff's Mac (Nov 9): Stop during Verifying, then Back Up: 0 copied,
+  139 earlier verified, 700 unchanged, Up to date. Smoke tests passed on his Mac.
+- 1.39.2 (Jeff): a run that only reads back earlier copies drew the graph orange (readStart 0 was treated
+  as "no split") and showed "Avg 0.0 MB/s", "Copying" in the legend and "Zero KB of Zero KB". Now the
+  graph is all blue, and those copy-only bits are hidden when nothing was copied (readOnly).
+
+### Nov 9 afternoon results on 1.39.2 (Capture One open)
+- C2 PASS: Stop during Verifying (Big -> SSTest_APFS/Big_c2), Back Up: 0 copied, 139 earlier verified.
+- C1 PASS: cable pulled during Verifying (Big -> WolkPhoto1TB_A/Big_C1). Rerun: 12 copied (the last 12
+  large files had reverted: their final rename/date bookkeeping was still in memory when the cable went),
+  688 earlier verified, report "700 of 700" checksums, verify_backup PASS 700/700, no temps.
+  Lesson: a yank seconds after commits can undo them; the next run catches it. Candidate fix (not built):
+  flush the drive (like Eject does) before showing "Up to date". Jeff hasn't asked for it yet.
+- D6 PASS on SSTest_APFS/D6_c: unreadable file flagged (red line, report), locked file backed up and
+  still uchg, the two locked temps left by 1.36 swept, rerun 0 copied / same red line.
+- Mistake found: Big_C1 was still a destination, so Tricky was backed up into it and the 700 Big files
+  were moved to its archive (20.98 GB, nothing deleted). Led to 1.40.
+- Verdict given to Jeff: ready for a real job (eject before unplugging; check each card's folder).
+
+### 1.40 (Nov 9; wrong-folder warning, Jeff's wording)
+- Before a manual backup (requestStartSync, in the same detached pass as the drive check), each
+  destination is checked with DigiFastBackupEngine.otherSourceName(source:destination:):
+  manifest has sourceName (new, SyncRecord.sourceName, written by the engine with the manifest) ->
+  warn if it differs from the source folder's name; older manifests -> the top-level *.cosessiondb name
+  decides (Capture One names it after the session), else warn only when nothing at the top level is in
+  common. New/empty folder (no manifest): no warning.
+- Dialog "Folder names don't match. Continue?" lists "“Big_C1” on WolkPhoto1TB_A holds a backup of
+  “Big”. You're backing up “Tricky”." and what continuing does (archive on: other files move to the
+  archive, nothing deleted). Cancel is the default (Return); Continue goes on to the usual drive checks.
+  Shown before the slow-link / format dialog. Scheduled backups and drives joining mid-backup never prompt.
+- Smoke test (v1.40): same source nil, different source by recorded name, empty folder nil, older backup
+  of another session by database name, renamed folder of the same session nil, nothing in common "".
+- Build: the standard one-liner.

@@ -575,12 +575,27 @@ struct ShootWrapProject: Codable {
         let destinations = backups
         driveCheckRunning = true
         syncMessage = "Checking drive connections…"
+        let sourceFolder: URL? = syncSource
         Task.detached(priority: .userInitiated) {
             let statuses = DigiDriveCheck.inspectAll(destinations)
+            // v1.40: backup folders that already hold a backup of a different folder.
+            var mismatches: [(URL, String)] = []
+            if let sourceFolder {
+                for destination in destinations {
+                    if let other = DigiFastBackupEngine.otherSourceName(source: sourceFolder, destination: destination) {
+                        mismatches.append((destination, other))
+                    }
+                }
+            }
+            let found = mismatches
             await MainActor.run {
                 self.driveCheckRunning = false
                 self.driveStatusGeneration += 1
                 self.driveStatus = Dictionary(statuses.map { ($0.destinationPath, $0) }, uniquingKeysWith: { _, new in new })
+                if !found.isEmpty, let sourceFolder, !self.confirmFolderMismatch(found, source: sourceFolder) {
+                    self.syncMessage = "Backup not started."
+                    return
+                }
                 let slow = statuses.filter { $0.linkWarning != nil }
                 // v1.8: warn before backing up to drives that aren't APFS.
                 let formatIssues = statuses.filter { Self.formatAdvice(for: $0) != nil }
@@ -622,6 +637,30 @@ struct ShootWrapProject: Codable {
             }
         }
     }
+    /// v1.40: "Folder names don't match. Continue?" Cancel is the default (Return).
+    func confirmFolderMismatch(_ mismatches: [(URL, String)], source: URL) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Folder names don't match. Continue?"
+        var lines: [String] = []
+        for (destination, other) in mismatches {
+            let drive: String = destination.deletingLastPathComponent().lastPathComponent
+            var line: String = "“" + destination.lastPathComponent + "” on " + drive + " holds a backup of "
+            line += other.isEmpty ? "a different folder" : "“" + other + "”"
+            line += ". You're backing up “" + source.lastPathComponent + "”."
+            lines.append(line)
+        }
+        if archiveRemoved {
+            lines.append("If you continue, files in " + (mismatches.count == 1 ? "that folder" : "those folders") + " that aren't in “" + source.lastPathComponent + "” are moved to the archive there. Nothing is deleted.")
+        } else {
+            lines.append("If you continue, “" + source.lastPathComponent + "” is copied in alongside what's already there.")
+        }
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Continue")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
     // MARK: Sounds (v1.11)
 
     nonisolated static let soundsKey = "DigiSuite.sounds"
@@ -2888,9 +2927,11 @@ struct ShootWrapView: View {
             let running: Bool = model.syncBusy && !destinationFinished(item)
             // v1.28: a backup too short to draw a graph shows no empty graph.
             let hasGraph: Bool = running || item.speedSamples.count > 1
+            // v1.39.2: a run that only read back earlier copies copied nothing; no copy speed or sizes.
+            let readOnly: Bool = item.readSampleStart == 0 && item.totalBytes == 0
             HStack(spacing: 8) {
                 if running { Text("Now " + mbps(now)) }
-                Text("Avg " + mbps(item.bytesPerSecond / 1_000_000))
+                if !readOnly { Text("Avg " + mbps(item.bytesPerSecond / 1_000_000)) }
                 if item.peakMBps > 0 { Text("Peak " + mbps(item.peakMBps)) }
                 Spacer(minLength: 4)
             }
@@ -2901,18 +2942,22 @@ struct ShootWrapView: View {
             }
             if hasGraph && item.readSampleStart != nil {
                 HStack(spacing: 12) {
-                    Label("Copying", systemImage: "circle.fill").foregroundStyle(DigiBrand.accent)
+                    if !readOnly {
+                        Label("Copying", systemImage: "circle.fill").foregroundStyle(DigiBrand.accent)
+                    }
                     Label("Reading back to verify", systemImage: "circle.fill").foregroundStyle(Color(red: 0.36, green: 0.72, blue: 0.95))
                     Spacer(minLength: 0)
                 }
                 .font(.caption2).labelStyle(.titleAndIcon).imageScale(.small)
             }
-            HStack(spacing: 8) {
-                Text(bytes(item.completedBytes) + " of " + bytes(item.totalBytes))
-                Spacer(minLength: 4)
-                Text(bytes(remaining) + " remaining")
+            if !readOnly {
+                HStack(spacing: 8) {
+                    Text(bytes(item.completedBytes) + " of " + bytes(item.totalBytes))
+                    Spacer(minLength: 4)
+                    Text(bytes(remaining) + " remaining")
+                }
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
-            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
     }
 
@@ -2999,8 +3044,8 @@ struct ShootWrapView: View {
 
     private var backupOverallFraction: Double {
         // v1.27: Full verify counts copying and reading back.
-        let total: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + ($1.readBackOn ? $1.totalBytes * 2 : $1.totalBytes) }
-        let done: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + $1.completedBytes + $1.verifiedBytes }
+        let total: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + $1.workBytes }
+        let done: Int64 = model.syncProgress.reduce(Int64(0)) { $0 + $1.workDoneBytes }
         guard total > 0 else { return 0 }
         return min(1, Double(done) / Double(total))
     }
@@ -3238,6 +3283,7 @@ struct ShootWrapView: View {
         } else {
             parts.append("\(progress.completedFiles.formatted()) copied, checksummed")
         }
+        if progress.earlierVerified > 0 { parts.append("\(progress.earlierVerified.formatted()) earlier verified") }
         if progress.renamedFiles > 0 { parts.append("\(progress.renamedFiles.formatted()) renamed") }
         if progress.repairedFiles > 0 { parts.append("\(progress.repairedFiles.formatted()) re-copied") }
         if progress.skippedFiles > 0 { parts.append("\(progress.skippedFiles.formatted()) skipped") }
@@ -3249,9 +3295,10 @@ struct ShootWrapView: View {
     private func progressFraction(_ item: SyncProgress) -> Double {
         if item.status == DigiFastBackupEngine.completeStatus { return 1 }
         // v1.27: with Full verify the bar covers copying and reading back (half each).
-        if item.readBackOn && item.totalBytes > 0 {
-            let done: Double = Double(item.completedBytes + item.verifiedBytes)
-            return min(1, done / Double(item.totalBytes * 2))
+        // v1.39: plus reading back copies an earlier run left unchecked.
+        if item.readBackOn && item.workBytes > 0 {
+            let done: Double = Double(item.workDoneBytes)
+            return min(1, done / Double(item.workBytes))
         }
         if item.totalBytes > 0 { return min(1, Double(item.completedBytes) / Double(item.totalBytes)) }
         return item.status == DigiFastBackupEngine.completeStatus ? 1 : 0
@@ -3318,6 +3365,18 @@ struct ShootWrapView: View {
             let what: String = one ? "file couldn't be backed up and is NOT on this drive" : "files couldn't be backed up and are NOT on this drive"
             Label(count + " " + what + " (no permission to read, or locked). Everything else is backed up. See the report for which and how to fix.", systemImage: "xmark.octagon.fill")
                 .font(.caption).foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // v1.39: copies on this drive that haven't been read back yet (a stopped or
+        // interrupted backup, or Quick mode after one). Honest, not alarming: they're on
+        // the drive, just not checked yet.
+        if progress.pendingReadBack > 0 && !model.syncBusy {
+            let one: Bool = progress.pendingReadBack == 1
+            let count: String = progress.pendingReadBack.formatted()
+            let what: String = one ? "copy on this drive hasn't" : "copies on this drive haven't"
+            let how: String = progress.readBackOn ? "The next backup reads " + (one ? "it" : "them") + " back first." : "The next backup with Full checksums reads " + (one ? "it" : "them") + " back first."
+            Label(count + " " + what + " been read back yet (the backup was stopped or interrupted). " + how, systemImage: "clock.badge.exclamationmark")
+                .font(.caption).foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
         }
         if !progress.archiveNote.isEmpty {
@@ -4813,13 +4872,17 @@ struct DigiSpeedSparkline: View {
 
     @ViewBuilder private func graph(_ plotted: [CGPoint], height: CGFloat) -> some View {
         let split: Int? = readStart.flatMap { $0 > 0 && $0 < plotted.count ? $0 : nil }
-        let writePoints: [CGPoint] = split.map { Array(plotted[0...$0]) } ?? plotted
-        let readPoints: [CGPoint] = split.map { Array(plotted[$0...]) } ?? []
-        area(writePoints, height: height)
-            .fill(LinearGradient(colors: [DigiBrand.accent.opacity(0.35), DigiBrand.accent.opacity(0.04)],
-                                 startPoint: .top, endPoint: .bottom))
-        line(writePoints)
-            .stroke(DigiBrand.accent, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        // v1.39.2: read-back from the very start (only earlier copies to check): all blue.
+        let readsOnly: Bool = readStart == 0
+        let writePoints: [CGPoint] = readsOnly ? [] : (split.map { Array(plotted[0...$0]) } ?? plotted)
+        let readPoints: [CGPoint] = readsOnly ? plotted : (split.map { Array(plotted[$0...]) } ?? [])
+        if !writePoints.isEmpty {
+            area(writePoints, height: height)
+                .fill(LinearGradient(colors: [DigiBrand.accent.opacity(0.35), DigiBrand.accent.opacity(0.04)],
+                                     startPoint: .top, endPoint: .bottom))
+            line(writePoints)
+                .stroke(DigiBrand.accent, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        }
         if !readPoints.isEmpty {
             area(readPoints, height: height)
                 .fill(LinearGradient(colors: [Self.readColor.opacity(0.30), Self.readColor.opacity(0.04)],

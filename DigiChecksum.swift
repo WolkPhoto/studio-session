@@ -261,6 +261,13 @@ enum DigiBackupReport {
         var skipped: [String] = []
         /// v1.37: files that couldn't be backed up as they are (unreadable, lock), with why.
         var problems: [(String, String)] = []
+        /// v1.39: checksums of copies left by an earlier, interrupted run (kept on record),
+        /// how many of them this run read back (or checksummed, in Quick), and how many
+        /// copies on the drive are still waiting to be read back after this run.
+        var earlier: [(String, UInt64)] = []
+        var earlierVerified: Int = 0
+        var earlierRecorded: Int = 0
+        var pendingLeft: Int = 0
     }
 
     static func files(_ count: Int) -> String { count == 1 ? "1 file" : "\(count) files" }
@@ -311,6 +318,76 @@ enum DigiBackupReport {
     }
 
     static let checksumFileName = "Checksums.xxh64"
+    /// v1.39: copies whose checksum is known but that haven't been read back yet. Written
+    /// line by line while a backup copies, so a Stop, a yanked drive or a crash leaves a
+    /// record; the next backup reads these back first. Hidden; reports never list it.
+    static let pendingFileName = ".StudioSession-ReadBackPending.xxh64"
+    /// v1.39: present while a checksummed backup runs (its start time inside). Still there
+    /// at the next backup = the last one never finished its bookkeeping.
+    static let runMarkerName = ".StudioSession-BackupRunning"
+
+    static func readRunMarker(_ url: URL) -> Date? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return nil }
+        if let text = try? String(contentsOf: url, encoding: .utf8),
+           let seconds = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return Date(timeIntervalSince1970: seconds)
+        }
+        // Unreadable marker: fall back to when it was written.
+        return (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date ?? Date.distantPast
+    }
+
+    static func writeRunMarker(_ url: URL, started: Date) throws {
+        let text: String = String(format: "%.3f\n", started.timeIntervalSince1970)
+        try Data(text.utf8).write(to: url, options: .atomic)
+    }
+
+    /// Rewrites the pending list (atomic); an empty list removes the file.
+    static func writePending(_ entries: [String: UInt64], to url: URL) throws {
+        let fm = FileManager.default
+        if entries.isEmpty {
+            if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+            return
+        }
+        var lines: [String] = []
+        for key in entries.keys.sorted() {
+            if let hash = entries[key] { lines.append(XXHash64.hex(hash) + "  " + key) }
+        }
+        let text: String = lines.joined(separator: "\n") + "\n"
+        try Data(text.utf8).write(to: url, options: .atomic)
+    }
+
+    /// v1.39: appends "<hash>  <path>" lines to the pending list as copies land. Pushed to
+    /// the drive at most every half second, so a yank loses at most the last moment; the
+    /// run marker covers that gap (see DigiStreamEngine.sync).
+    final class PendingJournal: @unchecked Sendable {
+        private var descriptor: Int32 = -1
+        private var lastSync = Date()
+
+        init(url: URL) {
+            descriptor = Darwin.open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        }
+
+        func append(_ relative: String, _ hash: UInt64) {
+            guard descriptor >= 0 else { return }
+            let line: String = XXHash64.hex(hash) + "  " + relative + "\n"
+            let bytes = Array(line.utf8)
+            _ = bytes.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress, $0.count) }
+            if Date().timeIntervalSince(lastSync) >= 0.5 {
+                _ = Darwin.fsync(descriptor)
+                lastSync = Date()
+            }
+        }
+
+        func close() {
+            guard descriptor >= 0 else { return }
+            _ = Darwin.fsync(descriptor)
+            _ = Darwin.close(descriptor)
+            descriptor = -1
+        }
+
+        deinit { close() }
+    }
 
     /// Reads an xxhsum list: "<16 hex>  <path>" per line.
     static func readChecksums(_ url: URL) -> [String: String] {
@@ -331,15 +408,27 @@ enum DigiBackupReport {
         // Nothing new (a scheduled backup that found no changes): no new report.
         // v1.29: a run that only skipped busy files still gets a report, so there
         // is a record of what was left for the next run.
-        if input.verified.isEmpty && input.removed.isEmpty && input.skipped.isEmpty && input.problems.isEmpty && input.status == DigiFastBackupEngine.completeStatus { return "" }
         let fm = FileManager.default
-        try DigiStreamEngine.ensureDirectory(DigiFastBackupEngine.reportsName, under: input.destination, device: input.device)
         let folder = input.destination.appendingPathComponent(DigiFastBackupEngine.reportsName, isDirectory: true)
+        let listURL = folder.appendingPathComponent(checksumFileName)
+        var list = readChecksums(listURL)
+        // v1.39: checksums of copies left by an interrupted run that never made it into
+        // the list (the drive was yanked before the end of that run).
+        var earlierAdded = 0
+        for (relative, hash) in input.earlier {
+            let hex: String = XXHash64.hex(hash)
+            if list[relative] != hex {
+                list[relative] = hex
+                earlierAdded += 1
+            }
+        }
+        let nothingNew: Bool = input.verified.isEmpty && input.removed.isEmpty && earlierAdded == 0
+        let quietRun: Bool = input.skipped.isEmpty && input.problems.isEmpty && input.earlierVerified == 0 && input.earlierRecorded == 0
+        if nothingNew && quietRun && input.status == DigiFastBackupEngine.completeStatus { return "" }
+        try DigiStreamEngine.ensureDirectory(DigiFastBackupEngine.reportsName, under: input.destination, device: input.device)
 
         // Cumulative list: update copied files, drop files archived as removed
         // and anything no longer in the session.
-        let listURL = folder.appendingPathComponent(checksumFileName)
-        var list = readChecksums(listURL)
         for (relative, hash) in input.verified { list[relative] = XXHash64.hex(hash) }
         for relative in input.removed { list[relative] = nil }
         if !input.sourceKeys.isEmpty {
@@ -381,6 +470,8 @@ enum DigiBackupReport {
         var resultLine: String = complete ? doneLine : notDone
         if complete && !input.problems.isEmpty {
             resultLine = "COMPLETE EXCEPT " + files(input.problems.count).uppercased() + " THAT COULDN'T BE BACKED UP (listed below)"
+        } else if complete && input.readBack && input.pendingLeft > 0 {
+            resultLine = "COMPLETE, but " + files(input.pendingLeft) + " still waiting to be read back (see below)"
         }
         text += "Result:    " + resultLine + "\n\n"
         text += "Session:   " + input.source.lastPathComponent + "\n"
@@ -406,6 +497,17 @@ enum DigiBackupReport {
             text += "Older versions moved to the archive:  " + files(input.archived) + "\n"
         }
         text += "Already on the drive, unchanged:  " + files(input.unchangedFiles) + "\n"
+        if input.earlierVerified > 0 {
+            text += "Left unchecked by an earlier backup that was stopped or interrupted,\n"
+            text += "  read back and verified this run:  " + files(input.earlierVerified) + "\n"
+        }
+        if input.earlierRecorded > 0 {
+            text += "Left by an earlier backup that was interrupted, original checksummed this run:  " + files(input.earlierRecorded) + "\n"
+        }
+        if input.pendingLeft > 0 {
+            text += "Still waiting to be read back:  " + files(input.pendingLeft) + " (copied by a backup that stopped or was\n"
+            text += "  interrupted, or in Quick mode). The next backup with Full checksums reads them back first.\n"
+        }
         if !input.skipped.isEmpty {
             text += "\nSTILL BEING WRITTEN, SKIPPED THIS RUN:  " + files(input.skipped.count) + "\n"
             text += "These files were changing on the source while the backup ran (Capture One or a\n"

@@ -49,6 +49,15 @@ struct SyncProgress: Identifiable, Sendable {
     var skippedFiles = 0
     /// v1.37: files that couldn't be backed up as they are (unreadable / lock), skipped and flagged.
     var problemFiles = 0
+    /// v1.39: copies left unchecked by an earlier run (Stop, yanked drive, crash) that this
+    /// run reads back first. Their bytes are extra read-back work on top of totalBytes x 2.
+    var extraReadBytes: Int64 = 0
+    var earlierVerified = 0
+    /// v1.39: after the run, copies on this drive still waiting to be read back.
+    var pendingReadBack = 0
+    /// v1.39: the work the bar and time left cover (copy + read back with Full verify).
+    var workBytes: Int64 { readBackOn ? totalBytes * 2 + extraReadBytes : totalBytes }
+    var workDoneBytes: Int64 { readBackOn ? completedBytes + verifiedBytes : completedBytes }
     /// v1.28: how long copying took, and the read-back pass, separately.
     var copyPhaseSeconds: Double = 0
     var verifyPhaseSeconds: Double = 0
@@ -82,6 +91,9 @@ struct BackupFilter: Codable, Sendable, Equatable {
 struct SyncRecord: Codable {
     // Same schema as older builds. Values describe copy/metadata state, not hashes.
     var files: [String: String] = [:]
+    /// v1.40: the name of the folder this backup is of (older manifests don't have it;
+    /// older builds ignore it).
+    var sourceName: String?
 }
 
 final class BackupControl: @unchecked Sendable {
@@ -147,6 +159,40 @@ struct DigiSyncSourceSnapshot: Sendable {
 enum DigiFastBackupEngine {
     static let completeStatus = "Up to date"
     static let manifestName = ".shootwrap-sync-manifest.json"
+
+    /// v1.40: before a manual backup, does this backup folder already hold a backup of a
+    /// DIFFERENT folder? Returns nil when it's fine (new or empty folder, same source),
+    /// the other folder's name when it's on record, or "" when it's clearly a different
+    /// folder but the name isn't known (backups made before 1.40).
+    static func otherSourceName(source: URL, destination: URL) -> String? {
+        let manifestURL = destination.appendingPathComponent(manifestName)
+        guard let data = try? Data(contentsOf: manifestURL),
+              let record = try? JSONDecoder().decode(SyncRecord.self, from: data) else { return nil }
+        let sourceName: String = source.lastPathComponent
+        if let recorded = record.sourceName {
+            return recorded == sourceName ? nil : recorded
+        }
+        let fm = FileManager.default
+        let sourceTop: [String] = (try? fm.contentsOfDirectory(atPath: source.path)) ?? []
+        // A Capture One session's database is named after the session.
+        var backedDatabase: String?
+        for key in record.files.keys where !key.contains("/") && key.hasSuffix(".cosessiondb") {
+            backedDatabase = key
+            break
+        }
+        let sourceDatabase: String? = sourceTop.first { $0.hasSuffix(".cosessiondb") }
+        if let backedDatabase, let sourceDatabase {
+            if backedDatabase == sourceDatabase { return nil }
+            return (backedDatabase as NSString).deletingPathExtension
+        }
+        // Nothing in common at the top level: clearly a different folder.
+        var backedTop = Set<String>()
+        for key in record.files.keys {
+            if let first = key.split(separator: "/").first { backedTop.insert(String(first)) }
+        }
+        if !backedTop.isEmpty && backedTop.isDisjoint(with: Set(sourceTop)) { return "" }
+        return nil
+    }
     /// v1.25: new archives go in _StudioSession_Archive. Older drives may still
     /// hold _ShootWrap_Archive; both are left out of scans and shown in the archive tools.
     static let archiveName = "_StudioSession_Archive"

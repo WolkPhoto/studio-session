@@ -76,12 +76,10 @@ struct DigiBackupSnapshot {
                 let isComplete = progress.status == DigiFastBackupEngine.completeStatus
                 let isProblem = progress.status.hasPrefix("Error") || progress.status == "Source Unavailable" ||
                     progress.status == DigiDestinationLock.busyStatus
-                if progress.totalBytes > 0 {
+                if progress.workBytes > 0 {
                     // v1.27: Full verify counts copying and reading back, half each.
-                    var ratio = Double(progress.completedBytes) / Double(progress.totalBytes)
-                    if progress.readBackOn {
-                        ratio = Double(progress.completedBytes + progress.verifiedBytes) / Double(progress.totalBytes * 2)
-                    }
+                    // v1.39: plus reading back copies an earlier run left unchecked.
+                    let ratio: Double = Double(progress.workDoneBytes) / Double(progress.workBytes)
                     fraction = min(1, max(0, ratio))
                 } else if isComplete {
                     fraction = 1
@@ -105,8 +103,8 @@ struct DigiBackupSnapshot {
                     driveETA = left
                     longest = max(longest ?? 0, left)
                 }
-                let work: Int64 = progress.readBackOn ? progress.totalBytes * 2 : progress.totalBytes
-                let workDone: Int64 = progress.readBackOn ? progress.completedBytes + progress.verifiedBytes : progress.completedBytes
+                let work: Int64 = progress.workBytes
+                let workDone: Int64 = progress.workDoneBytes
                 total += work
                 done += min(workDone, work)
                 speed += mbps
