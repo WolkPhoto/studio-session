@@ -446,7 +446,7 @@ enum MetadataFolderMode: String {
         // v1.43.4: every reason Start can't run is a dialog (Return closes it), never just small text.
         guard MetadataSidecar.exiftoolPath() != nil else {
             status = "ExifTool isn't installed."
-            simpleAlert("ExifTool isn't installed", "Studio Session uses the free ExifTool to write sidecars. Get it at exiftool.org (or in Terminal: brew install exiftool), then click Start Watching again.")
+            simpleAlert("ExifTool couldn't run", "Studio Session's built-in copy of ExifTool needs macOS's Perl (/usr/bin/perl), which wasn't found. Installing ExifTool from exiftool.org (or in Terminal: brew install exiftool) works too. Then click Start Watching again.")
             return
         }
         guard hasValues else {

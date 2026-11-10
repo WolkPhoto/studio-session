@@ -1,4 +1,4 @@
-Studio Session 1.44
+Studio Session 1.45
 
 New since 1.40:
 
@@ -15,4 +15,4 @@ New since 1.40:
 - A warning when a backup folder already holds a different session's backup, before anything is copied.
 - Check for Updates now looks at the public download page, so future updates reach you automatically.
 
-Needs ExifTool for the Metadata tab (free: exiftool.org, or `brew install exiftool`).
+Nothing extra to install: the Metadata tab uses ExifTool by Phil Harvey (exiftool.org), which now comes built in.

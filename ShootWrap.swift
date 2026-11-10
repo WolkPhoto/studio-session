@@ -27,6 +27,11 @@ struct SessionStorageSummary {
         let otherImages: Set<String> = ["tif","tiff","psd","png","heic","heif","bmp","exr","gif","webp"]
         let videos: Set<String> = ["mov","mp4","m4v","avi","mxf","mts","mpg","mpeg"]
         let session: Set<String> = ["cosessiondb","cocatalogdb","col","costyle","cop","comask","comasks"]
+        // v1.46.6: names for what a non-photo folder holds (was all "Other Files").
+        let documents: Set<String> = ["pdf","doc","docx","pages","txt","rtf","md","key","numbers","xls","xlsx","csv","ppt","pptx"]
+        let audio: Set<String> = ["wav","mp3","aif","aiff","m4a","flac","aac","ogg"]
+        let archives: Set<String> = ["zip","dmg","pkg","rar","7z","tar","gz","tgz","iso","xip"]
+        let design: Set<String> = ["ai","indd","idml","sketch","fig","eps","svg","afdesign","afphoto"]
         let fm = FileManager.default
         var stats: [String: [String: (Int, Int64)]] = [:]
         guard let iterator = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey], options: [], errorHandler: { _, _ in true }) else { return .empty }
@@ -45,6 +50,10 @@ struct SessionStorageSummary {
             else if otherImages.contains(ext) { category = "Other Images" }
             else if videos.contains(ext) { category = "Video" }
             else if session.contains(ext) { category = "Session Files" }
+            else if documents.contains(ext) { category = "Documents" }
+            else if audio.contains(ext) { category = "Audio" }
+            else if design.contains(ext) { category = "Design Files" }
+            else if archives.contains(ext) { category = "Archives & Installers" }
             else { category = "Other Files" }
             let format = ext.isEmpty ? "(no extension)" : ext.uppercased()
             var formats = stats[category] ?? [:]
@@ -52,7 +61,8 @@ struct SessionStorageSummary {
             formats[format] = (old.0 + 1, old.1 + Int64(info.fileSize ?? 0))
             stats[category] = formats
         }
-        let order = ["RAW Images", "JPEG Images", "Other Images", "Capture One Data", "Session Files", "Video", "Other Files"]
+        let order = ["RAW Images", "JPEG Images", "Other Images", "Capture One Data", "Session Files", "Video",
+                     "Audio", "Documents", "Design Files", "Archives & Installers", "Other Files"]
         return SessionStorageSummary(categories: order.compactMap { name in
             guard let formats = stats[name] else { return nil }
             let entries = formats.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.2 > $1.2 }
@@ -92,6 +102,42 @@ struct CheckResult: Identifiable {
 }
 
 
+/// v1.46.4: one folder's files in the preview, grouped by their parent folder.
+/// v1.46.5: Capture One's own subfolders (CaptureOne/Cache/Proxies, Settings…) are folded
+/// into the folder they belong to, so the list shows the photo folders only.
+struct SyncPreviewFolder: Identifiable, Sendable {
+    let id: String          // the folder, relative to the source ("" = top level)
+    let files: [String]     // file names directly in it (not Capture One's), sorted
+    let bytes: Int64        // 0 when sizes aren't known (files gone from the source)
+    let captureOneFiles: [String]   // paths under its CaptureOne folder, sorted
+    let captureOneBytes: Int64
+
+    static func group(_ items: [(String, Int64)]) -> [SyncPreviewFolder] {
+        var names: [String: [String]] = [:]
+        var sizes: [String: Int64] = [:]
+        var c1Names: [String: [String]] = [:]
+        var c1Sizes: [String: Int64] = [:]
+        for (relative, size) in items {
+            let parts: [String] = relative.components(separatedBy: "/")
+            if let marker = parts.dropLast().firstIndex(where: { $0.caseInsensitiveCompare("CaptureOne") == .orderedSame }) {
+                let owner: String = parts[..<marker].joined(separator: "/")
+                let inside: String = parts[marker...].joined(separator: "/")
+                c1Names[owner, default: []].append(inside)
+                c1Sizes[owner, default: 0] += size
+                if names[owner] == nil { names[owner] = [] }
+            } else {
+                let folder: String = parts.dropLast().joined(separator: "/")
+                names[folder, default: []].append(parts.last ?? relative)
+                sizes[folder, default: 0] += size
+            }
+        }
+        return names.keys.sorted().map { folder in
+            SyncPreviewFolder(id: folder, files: (names[folder] ?? []).sorted(), bytes: sizes[folder] ?? 0,
+                              captureOneFiles: (c1Names[folder] ?? []).sorted(), captureOneBytes: c1Sizes[folder] ?? 0)
+        }
+    }
+}
+
 struct SyncPreviewDetail: Identifiable, Sendable {
     var id: String { destination }
     let destination: String
@@ -104,6 +150,15 @@ struct SyncPreviewDetail: Identifiable, Sendable {
     let rawModified: Int
     let rawRemoved: Int
     let error: String?
+    /// v1.46: sizes per kind and how many files the last backup tracked (for the
+    /// graphical preview and the removal-guard note).
+    var newBytes: Int64 = 0
+    var modifiedBytes: Int64 = 0
+    var tracked: Int = 0
+    /// v1.46.4: the same files grouped by parent folder for the preview lists.
+    var newFolders: [SyncPreviewFolder] = []
+    var modifiedFolders: [SyncPreviewFolder] = []
+    var removedFolders: [SyncPreviewFolder] = []
 }
 
 
@@ -380,6 +435,36 @@ struct ShootWrapProject: Codable {
     @Published var syncPaused = false
     @Published var syncPreview: [SyncPreviewDetail] = []
     @Published var syncPreviewReady = false
+    /// v1.46.3: what's in the backup source (sizes by kind), for the FROM card.
+    @Published var sourceSummary: SessionStorageSummary?
+    @Published var sourceSummaryScanning = false
+    private var sourceSummaryFor: URL?
+    func refreshSourceSummary(force: Bool = false) {
+        guard let source = syncSource?.standardizedFileURL else {
+            sourceSummary = nil; sourceSummaryFor = nil
+            return
+        }
+        if !force && sourceSummaryFor == source && (sourceSummary != nil || sourceSummaryScanning) { return }
+        sourceSummaryFor = source
+        // Home already measured this folder: reuse it instead of walking it again.
+        if !force, dashboardInventoryRoot?.standardizedFileURL == source, storageSummary.count > 0 {
+            sourceSummary = storageSummary
+            return
+        }
+        sourceSummary = nil
+        sourceSummaryScanning = true
+        Task.detached(priority: .utility) {
+            let summary = SessionStorageSummary.scan(source)
+            await MainActor.run {
+                guard self.sourceSummaryFor == source else { return }
+                self.sourceSummary = summary
+                self.sourceSummaryScanning = false
+            }
+        }
+    }
+    /// v1.46.2: a preview is being worked out; these drives get a card right away.
+    @Published var previewRunning = false
+    @Published var previewDestinations: [String] = []
     private var backupControl: BackupControl?
     // Version 16: each destination has its own control, parented to the
     // whole-backup control above. Top-level buttons act on everything.
@@ -911,13 +996,13 @@ struct ShootWrapProject: Codable {
 
     func discoverExternalBackupFolders() {
         guard let session = backupSourceForNaming else {
-            discoveredBackupMessage = "Open a session before discovering drives."
+            discoveredBackupMessage = "Choose a source (or open a session) to find matching folders on your drives."
             return
         }
         let sessionName = session.lastPathComponent
         guard !sessionName.isEmpty, !discoveredBackupScanning else { return }
         discoveredBackupScanning = true
-        discoveredBackupMessage = "Looking for matching session folders on mounted drives…"
+        discoveredBackupMessage = "Looking for matching folders on mounted drives…"
         let sessionPath = session.resolvingSymlinksInPath().standardizedFileURL.path
         DispatchQueue.global(qos: .utility).async {
             let fm = FileManager.default
@@ -966,18 +1051,40 @@ struct ShootWrapProject: Codable {
         }
     }
 
+    /// v1.46: a Use This Drive click that can't add the drive says why (it used to
+    /// return silently, and the message line isn't shown while drives are listed).
+    private func explainCantAdd(_ title: String, _ detail: String) {
+        discoveredBackupMessage = detail
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     func addDiscoveredBackupDestination(_ folder: URL) {
-        guard let session = root else { return }
+        // v1.46: was `guard let session = root`, i.e. the session open on Home. With a
+        // source chosen on Backups but no Home session ("No session open"), the click
+        // did nothing. The backup source is what matters here.
+        guard let source = backupSourceForNaming else {
+            explainCantAdd("Choose a source first", "Pick what to back up (Source › Change…) before adding a drive.")
+            return
+        }
         let candidate = folder.standardizedFileURL
-        let sourcePath = (syncSource ?? session).resolvingSymlinksInPath().standardizedFileURL.path
+        let sourcePath = source.resolvingSymlinksInPath().standardizedFileURL.path
         let targetPath = candidate.resolvingSymlinksInPath().standardizedFileURL.path
         guard targetPath != sourcePath,
               !targetPath.hasPrefix(sourcePath + "/"),
               !sourcePath.hasPrefix(targetPath + "/") else {
-            discoveredBackupMessage = "Cannot use the source folder or its parent/child as a destination."
+            explainCantAdd("Can't use this folder", "\(candidate.lastPathComponent) is the source folder, or inside it, or contains it. Pick a folder on another drive.")
             return
         }
-        guard FileManager.default.fileExists(atPath: candidate.path) else { return }
+        guard FileManager.default.fileExists(atPath: candidate.path) else {
+            explainCantAdd("Folder not found", "\(candidate.path) isn't there anymore. Click Refresh and try again.")
+            discoverExternalBackupFolders()
+            return
+        }
         // v1.6: offer to fix drive permissions instead of failing later.
         guard DigiDrivePermissions.ensureWritable(candidate) else {
             discoveredBackupMessage = "\(candidate.lastPathComponent) can't be written to, so it wasn't added."
@@ -1034,11 +1141,15 @@ struct ShootWrapProject: Codable {
     }
     func chooseSyncSource() {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
-        if panel.runModal() == .OK, let url = panel.url {
-            syncSource = url; syncProgress = []; syncPreviewReady = false
-            // v1.26: folder suggestions on connected drives follow the new source's name.
-            discoverExternalBackupFolders()
-        }
+        if panel.runModal() == .OK, let url = panel.url { setSyncSource(url) }
+    }
+    /// v1.46: also used when a folder is dropped on the FROM card.
+    func setSyncSource(_ url: URL) {
+        guard !syncBusy else { return }
+        syncSource = url; syncProgress = []; syncPreviewReady = false
+        // v1.26: folder suggestions on connected drives follow the new source's name.
+        discoverExternalBackupFolders()
+        refreshSourceSummary()
     }
     nonisolated static func syncInventory(_ root: URL, filter: BackupFilter = BackupFilter()) throws -> [(String, URL, Int64)] {
         let fm = FileManager.default
@@ -1069,7 +1180,7 @@ struct ShootWrapProject: Codable {
     nonisolated static func backupPlan(source: URL, destination: URL, filter: BackupFilter = BackupFilter(), snapshot: SyncSourceSnapshot? = nil) throws -> (changes: [BackupEntry], unchanged: Int, removed: [String], manifest: SyncRecord) {
         try DigiFastBackupEngine.plan(source: source, destination: destination, filter: filter, snapshot: snapshot)
     }
-    nonisolated static func syncFolder(source: URL, destination: URL, archiveChanged: Bool, archiveRemoved: Bool, filter: BackupFilter, snapshot: SyncSourceSnapshot? = nil, control: BackupControl, report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
+    nonisolated static func syncFolder(source: URL, destination: URL, archiveChanged: Bool, archiveRemoved: Bool, filter: BackupFilter, snapshot: SyncSourceSnapshot? = nil, control: BackupControl, allowLargeRemoval: Bool = false, report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
         // v21: one app at a time per backup folder (see DigiDestinationLock).
         let lock = DigiDestinationLock.acquire(destination)
         if case .busy = lock {
@@ -1100,7 +1211,7 @@ struct ShootWrapProject: Codable {
         trim()
         var result = await DigiStreamEngine.sync(source: source, destination: destination, archiveChanged: archiveChanged,
             archiveRemoved: archiveRemoved, filter: filter, snapshot: snapshot, control: control,
-            verify: verify, readBack: readBack, gate: gate, report: report)
+            verify: verify, readBack: readBack, gate: gate, allowLargeRemoval: allowLargeRemoval, report: report)
         trim()
         if trimmedRuns > 0 {
             let freed = ByteCountFormatter.string(fromByteCount: trimmedBytes, countStyle: .file)
@@ -1122,7 +1233,9 @@ struct ShootWrapProject: Codable {
         syncBusy = true
         syncPreviewReady = false
         syncPreview = []
-        syncMessage = "Preparing trial sync…"
+        previewDestinations = destinations.map(\.path)
+        previewRunning = true
+        syncMessage = "Working out what Back Up Now will copy…"
         Task.detached {
             var details: [SyncPreviewDetail] = []
             let rawTypes: Set<String> = ["iiq","cr2","cr3","nef","nrw","arw","raf","orf","rw2","dng","3fr","fff","mos","pef","srw","rwl","raw"]
@@ -1137,15 +1250,41 @@ struct ShootWrapProject: Codable {
                     func rawCount(_ files: [String]) -> Int {
                         files.filter { rawTypes.contains(URL(fileURLWithPath: $0).pathExtension.lowercased()) }.count
                     }
-                    details.append(SyncPreviewDetail(destination: dest.path, newFiles: added, modifiedFiles: modified, removedFiles: removed, unchanged: plan.unchanged, transferBytes: bytes, rawNew: rawCount(added), rawModified: rawCount(modified), rawRemoved: rawCount(removed), error: nil))
+                    var detail = SyncPreviewDetail(destination: dest.path, newFiles: added, modifiedFiles: modified, removedFiles: removed, unchanged: plan.unchanged, transferBytes: bytes, rawNew: rawCount(added), rawModified: rawCount(modified), rawRemoved: rawCount(removed), error: nil)
+                    let modifiedSet: Set<String> = Set(modified)
+                    var newSize: Int64 = 0
+                    var modifiedSize: Int64 = 0
+                    var newItems: [(String, Int64)] = []
+                    var modifiedItems: [(String, Int64)] = []
+                    for entry in plan.changes {
+                        if modifiedSet.contains(entry.relative) {
+                            modifiedSize += entry.size
+                            modifiedItems.append((entry.relative, entry.size))
+                        } else {
+                            newSize += entry.size
+                            newItems.append((entry.relative, entry.size))
+                        }
+                    }
+                    detail.newFolders = SyncPreviewFolder.group(newItems)
+                    detail.modifiedFolders = SyncPreviewFolder.group(modifiedItems)
+                    detail.removedFolders = SyncPreviewFolder.group(removed.map { ($0, Int64(0)) })
+                    detail.newBytes = newSize
+                    detail.modifiedBytes = modifiedSize
+                    detail.tracked = plan.manifest.files.count
+                    details.append(detail)
+                    let ready: SyncPreviewDetail = detail
+                    await MainActor.run { self.syncPreview.append(ready) }
                 } catch {
-                    details.append(SyncPreviewDetail(destination: dest.path, newFiles: [], modifiedFiles: [], removedFiles: [], unchanged: 0, transferBytes: 0, rawNew: 0, rawModified: 0, rawRemoved: 0, error: error.localizedDescription))
+                    let failed = SyncPreviewDetail(destination: dest.path, newFiles: [], modifiedFiles: [], removedFiles: [], unchanged: 0, transferBytes: 0, rawNew: 0, rawModified: 0, rawRemoved: 0, error: error.localizedDescription)
+                    details.append(failed)
+                    await MainActor.run { self.syncPreview.append(failed) }
                 }
             }
             let previewDetails = details
             await MainActor.run {
                 self.syncPreview = previewDetails
                 self.syncPreviewReady = true
+                self.previewRunning = false
                 self.syncBusy = false
                 self.syncMessage = "Preview complete. No destination files were modified."
             }
@@ -1172,6 +1311,11 @@ struct ShootWrapProject: Codable {
         let changed = archiveChanged, removed = archiveRemoved
         let control = BackupControl()
         backupControl = control
+        // v1.46: drives the person OK'd moving many removed files to the archive on.
+        // One OK covers one run.
+        let approved: Set<String> = approvedRemovals
+        approvedRemovals = []
+        runScheduled = scheduled
         let childControls = Dictionary(destinations.map { ($0.path, BackupControl(parent: control)) }, uniquingKeysWith: { first, _ in first })
         destinationControls = childControls
         pausedDestinations = []
@@ -1249,7 +1393,8 @@ struct ShootWrapProject: Codable {
                         let result = await Self.syncFolder(
                             source: source, destination: destination,
                             archiveChanged: changed, archiveRemoved: removed,
-                            filter: filters[destination.path] ?? BackupFilter(), snapshot: snapshot, control: destinationControl
+                            filter: filters[destination.path] ?? BackupFilter(), snapshot: snapshot, control: destinationControl,
+                            allowLargeRemoval: approved.contains(destination.path)
                         ) { update in
                             await MainActor.run {
                                 if let index = self.syncProgress.firstIndex(where: { $0.destination == update.destination }) {
@@ -1300,19 +1445,91 @@ struct ShootWrapProject: Codable {
         let successful = completedOutcomes.values.filter { $0 == "Up to date" }.count
         let unavailable = completedOutcomes.values.filter { $0.contains("Unavailable") }.count
         let stopped = completedOutcomes.values.filter { $0.hasPrefix("Stopped") }.count
-        let failures = completedOutcomes.count - successful - unavailable - stopped
+        // v1.46: drives held by the removal safety guard. After a backup the person
+        // started, they're asked (not a failure); after a scheduled one, it's a failure dialog.
+        let heldPaths: [String] = completedOutcomes.filter { $0.value.hasPrefix(DigiFastBackupEngine.removalHoldPrefix) }.map(\.key).sorted()
+        let askAboutHeld: Bool = !runScheduled && !heldPaths.isEmpty
+        let failures = completedOutcomes.count - successful - unavailable - stopped - heldPaths.count
         var parts = ["\(successful) up to date"]
+        if !heldPaths.isEmpty {
+            let names: String = heldPaths.map { Self.driveName(forDestination: $0) }.joined(separator: ", ")
+            let heldCount: String = String(heldPaths.count)
+            if askAboutHeld {
+                parts.append(heldCount + " waiting for your OK (" + names + ")")
+            } else {
+                parts.append(heldCount + " held because many files left the source (" + names + "); nothing was changed there. Run Back Up to review")
+            }
+        }
         if stopped > 0 { parts.append("\(stopped) stopped") }
         if unavailable > 0 { parts.append("\(unavailable) unavailable") }
         if failures > 0 { parts.append("\(failures) failed") }
         scheduleStatus = successful == completedOutcomes.count ? "Complete: all \(successful) destinations up to date" : "Partial: " + parts.joined(separator: ", ")
         // Free space changed; refresh the destination cards.
         refreshDriveStatus()
+        refreshSourceSummary(force: true)
         refreshArchiveInfo()
         autoSaveWorkspace()
         syncMessage = "Backup finished. \(scheduleStatus)"
-        notifyBackupResult(scheduleStatus)
+        if askAboutHeld && failures == 0 && unavailable == 0 {
+            // Only held drives: the question below is the alert.
+        } else if runScheduled && !heldPaths.isEmpty && failures == 0 && unavailable == 0 && heldPaths.allSatisfy({ heldAlerted.contains(heldKey($0)) }) {
+            // A schedule keeps hitting the same hold: it was already shown once.
+        } else {
+            notifyBackupResult(scheduleStatus)
+        }
+        for path in heldPaths { heldAlerted.insert(heldKey(path)) }
         Self.playOutcomeSound(completedOutcomes)
+        if askAboutHeld { confirmHeldRemovals(heldPaths) }
+    }
+
+    // MARK: v1.46 removal safety guard
+
+    /// Drives OK'd for the next run (consumed when it starts).
+    var approvedRemovals: Set<String> = []
+    private var runScheduled = false
+    /// Holds already alerted after a scheduled run (drive + count), so a 2-minute
+    /// schedule doesn't show the same dialog every run.
+    private var heldAlerted: Set<String> = []
+    private func heldKey(_ path: String) -> String {
+        let count: Int = syncProgress.first(where: { $0.destination == path })?.heldRemovals ?? 0
+        return path + "#\(count)"
+    }
+
+    /// Asks once per held drive whether to move the files that left the source to the
+    /// archive. Cancel (the default, Return) changes nothing. Continue runs the backup
+    /// again for the OK'd drives (the others are already up to date, so they're quick).
+    func confirmHeldRemovals(_ paths: [String]) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var approved: Set<String> = []
+            for path in paths {
+                guard let item = self.syncProgress.first(where: { $0.destination == path }) else { continue }
+                let drive: String = Self.driveName(forDestination: path)
+                let count: String = item.heldRemovals.formatted()
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                let noun: String = item.heldRemovals == 1 ? " file" : " files"
+                let question: String = "Move " + count + noun + " to the archive on “" + drive + "”?"
+                alert.messageText = question
+                var detail: String = item.status.replacingOccurrences(of: DigiFastBackupEngine.removalHoldPrefix, with: "")
+                detail += "\n\nThis can happen when the wrong folder is chosen as the source, or files were deleted or moved. Nothing on the drive has been changed yet."
+                detail += "\n\nContinue moves those files into " + DigiFastBackupEngine.archiveName + " on the drive (nothing is deleted) and finishes the backup."
+                alert.informativeText = detail
+                alert.addButton(withTitle: "Cancel")
+                alert.addButton(withTitle: "Continue")
+                alert.buttons[0].keyEquivalent = "\r"
+                alert.buttons[1].keyEquivalent = ""
+                if alert.runModal() == .alertSecondButtonReturn { approved.insert(path) }
+            }
+            guard !approved.isEmpty, !self.syncBusy else { return }
+            self.approvedRemovals = approved
+            self.startSync()
+        }
+    }
+    nonisolated static func driveName(forDestination path: String) -> String {
+        let parts = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        if parts.count >= 3, parts[1] == "Volumes" { return parts[2] }
+        return URL(fileURLWithPath: path).lastPathComponent
     }
     /// Starts one more drive inside the running backup.
     func joinRunningBackup(_ destination: URL) {
@@ -2740,7 +2957,11 @@ struct ShootWrapView: View {
     private func backupDropCard(title: String, path: String?, icon: String,
                                 emptyText: String, browse: @escaping () -> Void,
                                 drop: @escaping ([URL]) -> Void) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let empty: Bool = path == nil
+        let dashes: [CGFloat] = empty ? [6] : []
+        let borderWidth: CGFloat = empty ? 1.5 : 1
+        let borderOpacity: Double = empty ? 0.55 : 0.35
+        return VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.caption.bold()).foregroundStyle(.secondary)
             Spacer(minLength: 5)
             Image(systemName: icon).font(.system(size: 29)).foregroundStyle(.secondary)
@@ -2761,8 +2982,10 @@ struct ShootWrapView: View {
         .frame(maxWidth: .infinity, minHeight: 178)
         .background(DigiBrand.cardFill.opacity(0.45),
                     in: RoundedRectangle(cornerRadius: 12))
+        // v1.46: dashed while empty (drop a folder here), solid once a folder is chosen.
         .overlay(RoundedRectangle(cornerRadius: 12)
-            .strokeBorder(Color.secondary.opacity(0.55), style: StrokeStyle(lineWidth: 1.5, dash: [6])))
+            .strokeBorder(Color.secondary.opacity(borderOpacity),
+                          style: StrokeStyle(lineWidth: borderWidth, dash: dashes)))
         .contentShape(Rectangle())
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
             guard !model.syncBusy else { return false }
@@ -2920,44 +3143,38 @@ struct ShootWrapView: View {
         }
     }
 
-    @ViewBuilder private func destinationSpeedDetail(_ item: SyncProgress) -> some View {
+    /// v1.46: big live speed, this drive's own small speed line, then sizes.
+    @ViewBuilder private func destinationSpeedRow(_ item: SyncProgress, color: Color) -> some View {
         if item.totalBytes > 0 || !item.speedSamples.isEmpty {
-            let now: Double = currentSpeed(item)
-            let remaining: Int64 = max(Int64(0), item.totalBytes - item.completedBytes)
             let running: Bool = model.syncBusy && !destinationFinished(item)
-            // v1.28: a backup too short to draw a graph shows no empty graph.
-            let hasGraph: Bool = running || item.speedSamples.count > 1
-            // v1.39.2: a run that only read back earlier copies copied nothing; no copy speed or sizes.
             let readOnly: Bool = item.readSampleStart == 0 && item.totalBytes == 0
-            HStack(spacing: 8) {
-                if running { Text("Now " + mbps(now)) }
-                if !readOnly { Text("Avg " + mbps(item.bytesPerSecond / 1_000_000)) }
-                if item.peakMBps > 0 { Text("Peak " + mbps(item.peakMBps)) }
-                Spacer(minLength: 4)
-            }
-            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            if hasGraph {
-                DigiSpeedSparkline(samples: item.speedSamples, peak: item.peakMBps, height: 70,
-                                   readStart: item.readSampleStart, sampleSeconds: item.sampleSeconds)
-            }
-            if hasGraph && item.readSampleStart != nil {
-                HStack(spacing: 12) {
-                    if !readOnly {
-                        Label("Copying", systemImage: "circle.fill").foregroundStyle(DigiBrand.accent)
+            let remaining: Int64 = max(Int64(0), item.totalBytes - item.completedBytes)
+            HStack(alignment: .center, spacing: 12) {
+                if running {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(String(format: "%.0f", currentSpeed(item))).font(.title2.weight(.bold)).monospacedDigit()
+                        Text(item.verifyPhase ? "MB/s reading back" : "MB/s copying").font(.caption).foregroundStyle(.secondary)
                     }
-                    Label("Reading back to verify", systemImage: "circle.fill").foregroundStyle(Color(red: 0.36, green: 0.72, blue: 0.95))
+                    .frame(minWidth: 96, alignment: .leading)
+                } else if !readOnly && item.bytesPerSecond > 0 {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(String(format: "%.0f", item.bytesPerSecond / 1_000_000)).font(.title3.weight(.semibold)).monospacedDigit()
+                        Text("MB/s average copy").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(minWidth: 96, alignment: .leading)
+                }
+                if item.speedSamples.count > 1 {
+                    DigiSpeedGraph(series: driveSeries(URL(fileURLWithPath: item.destination), color: color), height: 40, compact: true)
+                } else {
                     Spacer(minLength: 0)
                 }
-                .font(.caption2).labelStyle(.titleAndIcon).imageScale(.small)
             }
-            if !readOnly {
-                HStack(spacing: 8) {
-                    Text(bytes(item.completedBytes) + " of " + bytes(item.totalBytes))
-                    Spacer(minLength: 4)
-                    Text(bytes(remaining) + " remaining")
-                }
-                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                if item.peakMBps > 0 { Text("Peak " + mbps(item.peakMBps)) }
+                Spacer(minLength: 4)
+                if !readOnly { Text(bytes(item.completedBytes) + " of " + bytes(item.totalBytes) + " · " + bytes(remaining) + " remaining") }
             }
+            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
     }
 
@@ -2970,6 +3187,12 @@ struct ShootWrapView: View {
         let totalFiles: Int = model.syncProgress.reduce(0) { $0 + $1.totalFiles }
         let averageBytes: Double = model.syncProgress.reduce(0.0) { $0 + $1.bytesPerSecond }
         let live: Double = model.syncProgress.reduce(0.0) { $0 + $1.liveMBps }
+        // v1.46.3: after a run where nothing needed copying, say so (not "Zero KB of Zero KB").
+        if !model.syncBusy && total == 0 {
+            let finished: Int = model.syncProgress.filter { $0.status == DigiFastBackupEngine.completeStatus }.count
+            if finished == model.syncProgress.count { return "Up to date: nothing new to copy" }
+            return "\(finished) of \(model.syncProgress.count) drives up to date"
+        }
         var parts: [String] = []
         parts.append(bytes(done) + " of " + bytes(total))
         parts.append("\(files) of \(totalFiles) files")
@@ -2985,7 +3208,7 @@ struct ShootWrapView: View {
     }
 
     @ViewBuilder private var backupActionButtons: some View {
-        if model.syncBusy {
+        if model.syncBusy && !model.previewRunning {
             Button {
                 model.togglePauseAll()
             } label: {
@@ -2994,10 +3217,10 @@ struct ShootWrapView: View {
             Button { model.stopSync() } label: { Label("Stop All", systemImage: "stop.fill") }
                 .tint(.red)
         } else {
-            Button("Trial Sync (Preview)") { model.previewSync() }
-                .disabled(model.syncSource == nil || model.backups.isEmpty || backupBenchmark.isRunning)
-            Button(model.driveCheckRunning ? "Checking Drives…" : "Start Backup") { model.requestStartSync() }
-                .disabled(model.syncSource == nil || model.backups.isEmpty || backupBenchmark.isRunning || model.driveCheckRunning)
+            Button(model.previewRunning ? "Working Out the Preview…" : "Preview What Will Copy") { model.previewSync() }
+                .disabled(model.syncSource == nil || model.backups.isEmpty || backupBenchmark.isRunning || model.previewRunning)
+            Button(model.driveCheckRunning ? "Checking Drives…" : "Back Up Now") { model.requestStartSync() }
+                .disabled(model.syncSource == nil || model.backups.isEmpty || backupBenchmark.isRunning || model.driveCheckRunning || model.previewRunning)
                 .buttonStyle(.borderedProminent)
         }
     }
@@ -3034,7 +3257,7 @@ struct ShootWrapView: View {
 
     @ViewBuilder private var backupSummaryLine: some View {
         if model.syncProgress.isEmpty {
-            Text("Ready to back up your session").foregroundStyle(.secondary)
+            Text("Ready to back up").foregroundStyle(.secondary)
         } else {
             Text(backupSummaryText())
                 .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
@@ -3138,17 +3361,17 @@ struct ShootWrapView: View {
         model.syncProgress.first(where: { $0.destination == backup.path })
     }
 
-    private func destinationCard(_ backup: URL) -> some View {
+    private func destinationCard(_ backup: URL, color: Color = DigiDriveColors.color(0)) -> some View {
         let progress: SyncProgress? = destinationProgress(backup)
         return backupCard {
             VStack(alignment: .leading, spacing: 8) {
-                destinationHeader(backup, progress: progress)
+                destinationHeader(backup, progress: progress, color: color)
                 destinationDriveLine(backup.path)
                 if let last = model.lastBackups[backup.path], !model.syncBusy || progress == nil {
                     Text(lastBackupText(last)).font(.caption).foregroundStyle(.secondary)
                 }
                 if let progress {
-                    destinationProgressBody(progress)
+                    destinationProgressBody(progress, color: color)
                 }
                 archiveLine(backup, copying: driveIsCopying(backup))
                 reportsLine(backup, copying: driveIsCopying(backup))
@@ -3240,10 +3463,11 @@ struct ShootWrapView: View {
         return model.ejectingVolumes.contains("/Volumes/" + parts[2])
     }
 
-    @ViewBuilder private func destinationHeader(_ backup: URL, progress: SyncProgress?) -> some View {
+    @ViewBuilder private func destinationHeader(_ backup: URL, progress: SyncProgress?, color: Color) -> some View {
         let title: String = driveTitle(for: backup)
         HStack(alignment: .center, spacing: 9) {
-            Image(systemName: "externaldrive.fill").font(.title3).foregroundStyle(.green)
+            // v1.46: this drive's color, the same as its bar and its line on the speed graph.
+            Capsule().fill(color).frame(width: 16, height: 5).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.title3.weight(.semibold)).lineLimit(1)
                 Text(backup.path).font(.caption).foregroundStyle(.secondary)
@@ -3304,10 +3528,11 @@ struct ShootWrapView: View {
         return item.status == DigiFastBackupEngine.completeStatus ? 1 : 0
     }
 
-    @ViewBuilder private func destinationProgressBody(_ progress: SyncProgress) -> some View {
+    @ViewBuilder private func destinationProgressBody(_ progress: SyncProgress, color: Color) -> some View {
         let paused: Bool = model.destinationIsPaused(progress.destination)
-        ProgressView(value: progressFraction(progress))
-            .tint(paused ? Color.orange : DigiBrand.accent)
+        // v1.46.6: drawn in the drive's exact color (the system bar darkened it, so it
+        // didn't match the speed line).
+        DigiColorBar(fraction: progressFraction(progress), color: color)
         HStack(spacing: 8) {
             if progress.status.hasPrefix("Error") {
                 Text(progress.status).foregroundStyle(.orange)
@@ -3323,7 +3548,17 @@ struct ShootWrapView: View {
             Text(backupETA(progress)).monospacedDigit()
         }
         .font(.caption).foregroundStyle(.secondary)
-        destinationSpeedDetail(progress)
+        destinationSpeedRow(progress, color: color)
+        if progress.status.hasPrefix(DigiFastBackupEngine.removalHoldPrefix) && !model.syncBusy {
+            HStack(spacing: 8) {
+                Label("Many files left the source, so this drive was held. Nothing on it was changed.", systemImage: "hand.raised.fill")
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button("Review…") { model.confirmHeldRemovals([progress.destination]) }
+            }
+            .font(.caption)
+        }
         HStack {
             if progress.verifyOn {
                 Label(copyCountText(progress), systemImage: "checkmark.seal")
@@ -3410,7 +3645,7 @@ struct ShootWrapView: View {
 
     private func connectedDriveSubtitle(_ drive: WrapModel.DiscoveredBackupDrive, inUse: URL?) -> String {
         if let inUse { return "Backing up to " + inUse.lastPathComponent }
-        if let match = drive.matchingFolder { return "Session folder found: " + match.lastPathComponent }
+        if let match = drive.matchingFolder { return "Matching folder found: " + match.lastPathComponent }
         return "A folder named " + drive.suggestedFolder.lastPathComponent + " will be created on this drive"
     }
 
@@ -3531,6 +3766,538 @@ struct ShootWrapView: View {
         }
     }
 
+    // MARK: v1.46 graphical preview
+
+    /// v1.46.2: shown right under the buttons, above Automatic Backups. A card per drive
+    /// appears the moment Preview is clicked and fills in when that drive's check is done.
+    @ViewBuilder private var backupPreviewSection: some View {
+        if model.previewRunning || model.syncPreviewReady {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Text("Preview: what Back Up Now will do").font(.headline)
+                    if model.previewRunning { ProgressView().controlSize(.small) }
+                }
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 360, maximum: 460), spacing: 12, alignment: .top)],
+                          alignment: .leading, spacing: 12) {
+                    ForEach(model.previewDestinations, id: \.self) { path in
+                        if let detail = model.syncPreview.first(where: { $0.destination == path }) {
+                            previewCard(detail)
+                        } else {
+                            previewPlaceholder(path)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func previewPlaceholder(_ path: String) -> some View {
+        let index: Int = model.backups.firstIndex(where: { $0.path == path }) ?? 0
+        return backupCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 9) {
+                    Capsule().fill(DigiDriveColors.color(index)).frame(width: 16, height: 5)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(WrapModel.driveName(forDestination: path)).font(.headline)
+                        Text(path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                }
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Comparing the folder with what's already on this drive…")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+                RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.12)).frame(height: 12)
+            }
+            .frame(minHeight: 150, alignment: .top)
+        }
+    }
+
+    private static let previewNewColor = Color(red: 0.30, green: 0.76, blue: 0.54)
+    private static let previewChangedColor = Color(red: 0.94, green: 0.65, blue: 0.29)
+    private static let previewRemovedColor = Color(red: 0.90, green: 0.42, blue: 0.36)
+    private static let previewSameColor = Color.secondary.opacity(0.45)
+
+    private struct PreviewSegment: Identifiable {
+        let id: String
+        let count: Int
+        let color: Color
+    }
+
+    private func previewBar(_ segments: [PreviewSegment]) -> some View {
+        let total: Int = max(1, segments.reduce(0) { $0 + $1.count })
+        let shown: [PreviewSegment] = segments.filter { $0.count > 0 }
+        return GeometryReader { geometry in
+            HStack(spacing: 2) {
+                ForEach(shown) { segment in
+                    let share: CGFloat = CGFloat(segment.count) / CGFloat(total)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(segment.color)
+                        .frame(width: max(4, share * (geometry.size.width - CGFloat(max(0, shown.count - 1)) * 2)))
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(height: 12)
+        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 3))
+    }
+
+    /// v1.46.4: files grouped by parent folder: folder, count and size; open a folder to
+    /// see every file in it (drawn lazily, so big folders stay quick).
+    private func previewNameList(_ names: [String]) -> some View {
+        LazyVStack(alignment: .leading, spacing: 1) {
+            ForEach(names, id: \.self) { name in
+                Text(name).font(.caption.monospaced()).textSelection(.enabled)
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private func previewFolderLabel(_ folder: SyncPreviewFolder, showSize: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "folder").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(folder.id.isEmpty ? "(top level)" : folder.id)
+                    .font(.caption).lineLimit(1).truncationMode(.head).help(folder.id)
+                if !folder.captureOneFiles.isEmpty {
+                    let extra: String = "+ " + folder.captureOneFiles.count.formatted() + " Capture One previews and settings"
+                    Text(showSize ? extra + " · " + bytes(folder.captureOneBytes) : extra)
+                        .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 6)
+            if !folder.files.isEmpty {
+                Text(folder.files.count.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                if showSize {
+                    Text(bytes(folder.bytes)).font(.caption.monospacedDigit())
+                        .frame(minWidth: 62, alignment: .trailing)
+                }
+            }
+        }
+    }
+
+    /// v1.46.4: files grouped by folder, with count and size; open one to see every file.
+    /// v1.46.5: Capture One's previews and settings sit in their own drawer inside it.
+    private func previewFolderList(_ folders: [SyncPreviewFolder], showSize: Bool) -> some View {
+        LazyVStack(alignment: .leading, spacing: 4) {
+            ForEach(folders) { folder in
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if !folder.files.isEmpty { previewNameList(folder.files) }
+                        if !folder.captureOneFiles.isEmpty {
+                            DisclosureGroup {
+                                previewNameList(folder.captureOneFiles).padding(.leading, 16)
+                            } label: {
+                                Text("Capture One previews and settings (" + folder.captureOneFiles.count.formatted() + ")")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.leading, 22).padding(.vertical, 2)
+                } label: {
+                    previewFolderLabel(folder, showSize: showSize)
+                }
+            }
+        }
+        .padding(.leading, 20).padding(.top, 4)
+    }
+
+    /// Long lists show the first 300 names (36,700 rows would freeze the window).
+    @ViewBuilder private func previewFileList(_ files: [String]) -> some View {
+        let limit: Int = 300
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(files.prefix(limit), id: \.self) { file in
+                Text(file).font(.caption.monospaced()).textSelection(.enabled)
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if files.count > limit {
+                Text("…and \((files.count - limit).formatted()) more").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.leading, 20).padding(.top, 4)
+    }
+
+    private func previewRowLabel(color: Color, title: String, count: Int, size: Int64?, note: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Circle().fill(color).frame(width: 10, height: 10)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(note).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Text(count.formatted() + (count == 1 ? " file" : " files")).font(.subheadline).foregroundStyle(.secondary).monospacedDigit()
+            Text(size.map { bytes($0) } ?? "").font(.subheadline.weight(.semibold)).monospacedDigit()
+                .frame(minWidth: 72, alignment: .trailing)
+        }
+    }
+
+    @ViewBuilder private func previewCard(_ preview: SyncPreviewDetail) -> some View {
+        let index: Int = model.backups.firstIndex(where: { $0.path == preview.destination }) ?? 0
+        let driveColor: Color = DigiDriveColors.color(index)
+        let fileCount: Int = preview.newFiles.count + preview.modifiedFiles.count + preview.removedFiles.count + preview.unchanged
+        let leavesSource: Int = preview.removedFiles.count
+        let needsOK: Bool = model.archiveRemoved && DigiFastBackupEngine.removalNeedsOK(removed: leavesSource, tracked: preview.tracked, sourceFiles: preview.newFiles.count + preview.modifiedFiles.count + preview.unchanged)
+        backupCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 9) {
+                    Capsule().fill(driveColor).frame(width: 16, height: 5)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(WrapModel.driveName(forDestination: preview.destination)).font(.headline)
+                        Text(preview.destination).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle).help(preview.destination)
+                    }
+                    Spacer(minLength: 4)
+                }
+                if let error = preview.error {
+                    Label("Preview error: " + error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                } else {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(bytes(preview.transferBytes)).font(.system(size: 30, weight: .bold)).monospacedDigit()
+                            Text(preview.transferBytes > 0 ? "to copy" : "nothing to copy").foregroundStyle(.secondary)
+                        }
+                        Text(fileCount.formatted() + " files checked").font(.caption).foregroundStyle(.secondary)
+                    }
+                    previewBar([
+                        PreviewSegment(id: "new", count: preview.newFiles.count, color: Self.previewNewColor),
+                        PreviewSegment(id: "changed", count: preview.modifiedFiles.count, color: Self.previewChangedColor),
+                        PreviewSegment(id: "removed", count: preview.removedFiles.count, color: Self.previewRemovedColor),
+                        PreviewSegment(id: "same", count: preview.unchanged, color: Self.previewSameColor)
+                    ])
+                    VStack(alignment: .leading, spacing: 8) {
+                        DisclosureGroup {
+                            previewFolderList(preview.newFolders, showSize: true)
+                        } label: {
+                            previewRowLabel(color: Self.previewNewColor, title: "New", count: preview.newFiles.count,
+                                            size: preview.newBytes, note: "copied to the drive")
+                        }
+                        Divider()
+                        DisclosureGroup {
+                            previewFolderList(preview.modifiedFolders, showSize: true)
+                        } label: {
+                            previewRowLabel(color: Self.previewChangedColor, title: "Changed", count: preview.modifiedFiles.count,
+                                            size: preview.modifiedBytes,
+                                            note: model.archiveChanged ? "copied; older versions go to the archive" : "copied over the older versions")
+                        }
+                        Divider()
+                        DisclosureGroup {
+                            previewFolderList(preview.removedFolders, showSize: false)
+                        } label: {
+                            previewRowLabel(color: Self.previewRemovedColor, title: "Gone from the source", count: preview.removedFiles.count,
+                                            size: nil,
+                                            note: model.archiveRemoved ? "moved to the archive on the drive" : "left on the drive")
+                        }
+                        Divider()
+                        previewRowLabel(color: Self.previewSameColor, title: "Unchanged", count: preview.unchanged,
+                                        size: nil, note: "skipped")
+                            .padding(.leading, 20)
+                    }
+                    Text("RAW images: \(preview.rawNew.formatted()) new · \(preview.rawModified.formatted()) changed · \(preview.rawRemoved.formatted()) gone from the source. Other files are Capture One settings, previews and the session database.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if needsOK {
+                        Label("Many files are gone from the source, so Back Up Now will ask before moving them to the archive on this drive.", systemImage: "hand.raised.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: v1.46 Backups layout
+
+    private var checkingPicker: some View {
+        Picker("Checking", selection: $model.verifyMode) {
+            Text("Off").tag("off")
+            Text("Quick").tag("quick")
+            Text("Full verify").tag("full")
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .disabled(model.syncBusy)
+        .help("How each copy is checked. Change it before a backup starts.")
+    }
+
+    @ViewBuilder private var backupSourceCard: some View {
+        if let source = model.syncSource {
+            sourceSummaryCard(source)
+        } else {
+            backupDropCard(title: "FROM", path: nil, icon: "folder",
+                           emptyText: "Choose or drop the folder to back up",
+                           browse: { model.chooseSyncSource() },
+                           drop: { urls in if let first = urls.first { model.setSyncSource(first) } })
+        }
+    }
+
+    private static let sourceKindColors: [String: Color] = [
+        "RAW Images": .blue, "JPEG Images": .purple, "Other Images": .pink,
+        "Capture One Data": .orange, "Session Files": .teal,
+        "Video": .green, "Audio": .mint, "Documents": .indigo, "Design Files": .yellow,
+        "Archives & Installers": .brown, "Other Files": .gray
+    ]
+
+    private func shortPath(_ url: URL) -> String {
+        let home: String = FileManager.default.homeDirectoryForCurrentUser.path
+        let path: String = url.path
+        if path.hasPrefix(home + "/") { return "~" + String(path.dropFirst(home.count)) }
+        return path
+    }
+
+    /// v1.46.3: the chosen source, like Home's Session composition in small: size, files,
+    /// a bar by kind and the biggest kinds. No border, the same card as the drives.
+    private func sourceSummaryCard(_ source: URL) -> some View {
+        let summary: SessionStorageSummary? = model.sourceSummary
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("FROM").font(.caption.bold()).foregroundStyle(.secondary)
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: "folder.fill").font(.title2).foregroundStyle(DigiBrand.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(source.lastPathComponent).font(.headline).lineLimit(2)
+                    Text(shortPath(source)).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(2).truncationMode(.middle).help(source.path)
+                }
+            }
+            if let summary, summary.count > 0 {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(bytes(summary.bytes)).font(.system(size: 26, weight: .bold)).monospacedDigit()
+                    Text(summary.count.formatted() + " files").font(.caption).foregroundStyle(.secondary)
+                }
+                sourceKindBar(summary)
+                VStack(alignment: .leading, spacing: 7) {
+                    // v1.46.6: biggest kinds first, each with its main file types underneath
+                    // ("DMG · ZIP"), so any folder says what's in it, not just photo sessions.
+                    ForEach(Array(summary.categories.sorted { $0.bytes > $1.bytes }.prefix(5))) { category in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Circle().fill(Self.sourceKindColors[category.name] ?? .gray).frame(width: 8, height: 8)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(category.name).font(.caption).lineLimit(1)
+                                Text(formatsText(category)).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                            }
+                            Spacer(minLength: 4)
+                            VStack(alignment: .trailing, spacing: 1) {
+                                Text(bytes(category.bytes)).font(.caption.weight(.semibold)).monospacedDigit()
+                                Text(category.count.formatted() + (category.count == 1 ? " file" : " files"))
+                                    .font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+                            }
+                        }
+                    }
+                }
+            } else if model.sourceSummaryScanning || summary == nil {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Measuring what's in this folder…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("This folder is empty.").font(.caption).foregroundStyle(.orange)
+            }
+            Spacer(minLength: 4)
+            Button("Change Folder…") { model.chooseSyncSource() }
+                .disabled(model.syncBusy).frame(maxWidth: .infinity)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 178, alignment: .topLeading)
+        .background(backupCardBackground, in: RoundedRectangle(cornerRadius: 16))
+        .contentShape(Rectangle())
+        .onAppear { model.refreshSourceSummary() }
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+            guard !model.syncBusy, let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { return }
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else { return }
+                let chosen: URL = url
+                Task { @MainActor in model.setSyncSource(chosen) }
+            }
+            return true
+        }
+    }
+
+    /// "ARW · JPG · DNG" (the three biggest file types in a kind).
+    private func formatsText(_ category: SessionStorageCategory) -> String {
+        let names: [String] = category.formats.prefix(3).map { $0.0 }
+        var text: String = names.joined(separator: " · ")
+        if category.formats.count > 3 { text += " +\(category.formats.count - 3)" }
+        return text
+    }
+
+    private func sourceKindBar(_ summary: SessionStorageSummary) -> some View {
+        let total: Double = Double(max(1, summary.bytes))
+        let kinds: [SessionStorageCategory] = summary.categories.filter { $0.bytes > 0 }
+        return GeometryReader { geometry in
+            HStack(spacing: 2) {
+                ForEach(kinds) { category in
+                    let share: CGFloat = CGFloat(Double(category.bytes) / total)
+                    let usable: CGFloat = geometry.size.width - CGFloat(max(0, kinds.count - 1)) * 2
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Self.sourceKindColors[category.name] ?? .gray)
+                        .frame(width: max(3, share * usable))
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(height: 10)
+    }
+
+    private var backupFlowArrow: some View {
+        Image(systemName: "arrow.right")
+            .font(.title2.weight(.semibold))
+            .foregroundStyle(DigiBrand.accent)
+            .padding(.top, 80)
+            .accessibilityHidden(true)
+    }
+
+    // Always side by side (ViewThatFits measured the cards' long one-line paths and
+    // would have stacked them almost always). The drive column takes the rest.
+    private var backupFlowRow: some View {
+        HStack(alignment: .top, spacing: 12) {
+            backupSourceCard.frame(width: 270)
+            backupFlowArrow
+            backupDriveColumn.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var backupDriveColumn: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("TO").font(.caption.bold()).foregroundStyle(.secondary)
+            if model.backups.isEmpty {
+                backupCard {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("No drives yet").font(.headline)
+                        Text("Plug in a drive and click Use This Drive below, or use Add Folder… for any folder.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            ForEach(Array(model.backups.enumerated()), id: \.element.path) { index, backup in
+                destinationCard(backup, color: DigiDriveColors.color(index))
+            }
+            availableDrivesBox
+        }
+        .onAppear { model.refreshArchiveInfo() }
+        .onChange(of: model.backups) { _, _ in model.refreshArchiveInfo() }
+    }
+
+    /// Connected drives not in use yet, plus Add Folder and Refresh.
+    private var availableDrivesBox: some View {
+        let unused: [WrapModel.DiscoveredBackupDrive] = model.discoveredBackupDrives.filter { destinationOnDrive($0) == nil }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(unused.isEmpty ? "Add a drive" : "Other connected drives").font(.subheadline.weight(.semibold))
+                Spacer(minLength: 6)
+                Button { model.discoverExternalBackupFolders() } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.discoveredBackupScanning)
+                Button { model.addBackup() } label: { Label("Add Folder…", systemImage: "folder.badge.plus") }
+            }
+            if model.discoveredBackupScanning {
+                ProgressView("Looking for drives…").controlSize(.small)
+            } else if unused.isEmpty {
+                Text("Plug in a drive and it shows up here. Add Folder… picks any folder.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(unused) { drive in
+                connectedDriveRow(drive)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(RoundedRectangle(cornerRadius: 14)
+            .strokeBorder(Color.secondary.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [6])))
+    }
+
+    private var backupActionRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                backupActionButtons.controlSize(.large)
+                backupSummaryLine
+                Spacer(minLength: 0)
+            }
+            if model.syncBusy && !model.previewRunning && !model.syncProgress.isEmpty {
+                ProgressView(value: backupOverallFraction).controlSize(.small)
+            } else {
+                Text(verifyModeExplanation)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 2)
+    }
+
+    /// Speed history for each drive in this run, lined up on one clock.
+    private func speedSeries() -> [DigiSpeedSeries] {
+        var earliest: Date?
+        for item in model.syncProgress {
+            guard let started = item.samplesStartedAt, !item.speedSamples.isEmpty else { continue }
+            if earliest == nil || started < earliest! { earliest = started }
+        }
+        var result: [DigiSpeedSeries] = []
+        for (index, backup) in model.backups.enumerated() {
+            guard let item = destinationProgress(backup), !item.speedSamples.isEmpty else { continue }
+            var offset: Double = 0
+            if let earliest, let started = item.samplesStartedAt { offset = max(0, started.timeIntervalSince(earliest)) }
+            result.append(DigiSpeedSeries(id: backup.path, name: driveTitle(for: backup),
+                                          color: DigiDriveColors.color(index), samples: item.speedSamples,
+                                          sampleSeconds: item.sampleSeconds, readStart: item.readSampleStart,
+                                          offset: offset))
+        }
+        return result
+    }
+
+    private func driveSeries(_ backup: URL, color: Color) -> [DigiSpeedSeries] {
+        guard let item = destinationProgress(backup), !item.speedSamples.isEmpty else { return [] }
+        return [DigiSpeedSeries(id: backup.path, name: driveTitle(for: backup), color: color,
+                                samples: item.speedSamples, sampleSeconds: item.sampleSeconds,
+                                readStart: item.readSampleStart, offset: 0)]
+    }
+
+    private var combinedSpeedNow: Double {
+        var total: Double = 0
+        for item in model.syncProgress where !destinationFinished(item) { total += currentSpeed(item) }
+        return total
+    }
+
+    @ViewBuilder private var backupSpeedPanel: some View {
+        let series: [DigiSpeedSeries] = speedSeries()
+        let backingUp: Bool = model.syncBusy && !model.previewRunning
+        if backingUp || series.contains(where: { $0.samples.count > 1 }) {
+            backupCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline, spacing: 14) {
+                        Text("SPEED").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        if backingUp {
+                            Text(String(format: "%.0f", combinedSpeedNow)).font(.title2.weight(.bold)).monospacedDigit()
+                            Text(series.count > 1 ? "MB/s combined now" : "MB/s now").font(.subheadline).foregroundStyle(.secondary)
+                        } else {
+                            Text("Last backup").font(.subheadline).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Text("solid = copying · dashed = reading back").font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 14) {
+                        ForEach(series) { item in
+                            HStack(spacing: 5) {
+                                Capsule().fill(item.color).frame(width: 14, height: 4)
+                                Text(item.name).lineLimit(1)
+                            }
+                            .font(.caption)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    DigiSpeedGraph(series: series, height: 150)
+                    Text("Point at the graph to see each drive's speed at that moment.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
     private var backupCardBackground: Color { DigiBrand.cardFill.opacity(0.55) }
 
     private func backupCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
@@ -3542,28 +4309,22 @@ struct ShootWrapView: View {
 
     var backups: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Backup Sync").font(.title2.bold())
-                    if let source = model.syncSource {
-                        Text(source.lastPathComponent).font(.subheadline).foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                if model.syncBusy {
+            // v1.46 layout (Jeff's pick, option A): FROM -> TO, the buttons, one speed
+            // graph for every drive, then schedule and archive.
+            HStack(alignment: .center, spacing: 12) {
+                if model.syncBusy && !model.previewRunning {
                     Label(backupHeaderStatus, systemImage: model.everythingPaused ? "pause.circle.fill" : "arrow.triangle.2.circlepath")
                         .foregroundStyle(model.everythingPaused ? .orange : .green)
                         .font(.subheadline.weight(.semibold))
                 }
+                Spacer(minLength: 8)
+                Text("Checking").font(.subheadline).foregroundStyle(.secondary)
+                checkingPicker
             }
-
-            // Version 18 layout: slim control bar, slim source row, and the
-            // space goes to one large card per destination drive.
-            backupControlBar
-            backupSourceRow
-            backupDestinationArea
-
-            connectedDrivesCard
+            backupFlowRow
+            backupActionRow
+            backupPreviewSection
+            backupSpeedPanel
 
             backupCard {
                 VStack(alignment: .leading, spacing: 12) {
@@ -3650,40 +4411,6 @@ struct ShootWrapView: View {
                     })
             }
             Divider()
-            if model.syncPreviewReady {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Trial Sync Results").font(.headline)
-                    ForEach(model.syncPreview) { preview in
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text(URL(fileURLWithPath: preview.destination).lastPathComponent).font(.headline)
-                            if let error = preview.error {
-                                Text("Preview error: " + error).foregroundStyle(.red)
-                            } else {
-                                Text("\(preview.newFiles.count) new, \(preview.modifiedFiles.count) modified, \(preview.removedFiles.count) removed from source, \(preview.unchanged) unchanged · " + ByteCountFormatter.string(fromByteCount: preview.transferBytes, countStyle: .file) + " to transfer")
-                                    .font(.caption).textSelection(.enabled)
-                                Text("RAW images: \(preview.rawNew) new · \(preview.rawModified) modified · \(preview.rawRemoved) removed (other changes may be Capture One settings, previews, or database files)")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                DisclosureGroup("New files (\(preview.newFiles.count))") {
-                                    ForEach(preview.newFiles, id: \.self) { file in Text(file).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
-                                }
-                                DisclosureGroup("Modified files (\(preview.modifiedFiles.count))" + (model.archiveChanged ? " · previous versions archived" : "")) {
-                                    ForEach(preview.modifiedFiles, id: \.self) { file in Text(file).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
-                                }
-                                DisclosureGroup("Removed from source (\(preview.removedFiles.count))" + (model.archiveRemoved ? " · to archive" : " · kept on destination")) {
-                                    ForEach(preview.removedFiles, id: \.self) { file in Text(file).font(.caption).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
-                                }
-                                DisclosureGroup("Unchanged (\(preview.unchanged))") {
-                                    Text("Unchanged files are skipped during sync. Their names are omitted to keep this preview fast.").font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.quaternary.opacity(0.25))
-                        .cornerRadius(8)
-                    }
-                }
-            }
             Text(model.syncMessage).font(.caption).foregroundStyle(.secondary)
 
         }
@@ -4804,35 +5531,93 @@ struct WorkspaceFolderNode: View {
 
 // Version 16: speed history graph for one destination. Shows dips and
 // recovery over the whole run; samples come from the backup engine.
-struct DigiSpeedSparkline: View {
+/// v1.46: one color per backup drive, used everywhere for that drive (card mark,
+/// progress bar, speed lines, hover readout). Copying vs reading back is shown by
+/// words and solid vs dashed lines, never by color.
+enum DigiDriveColors {
+    static let palette: [Color] = [
+        Color(red: 0.357, green: 0.612, blue: 0.961),   // blue   #5B9CF5
+        Color(red: 0.706, green: 0.549, blue: 0.949),   // purple #B48CF2
+        Color(red: 0.247, green: 0.757, blue: 0.690),   // teal   #3FC1B0
+        Color(red: 0.949, green: 0.545, blue: 0.722)    // pink   #F28BB8
+    ]
+    static func color(_ index: Int) -> Color { palette[((index % palette.count) + palette.count) % palette.count] }
+}
+
+/// One drive's speed history for a graph.
+struct DigiSpeedSeries: Identifiable {
+    let id: String
+    let name: String
+    let color: Color
     let samples: [Double]
-    let peak: Double
-    var height: CGFloat = 40
-    /// v1.27: where the read-back pass starts; drawn in a second color.
-    var readStart: Int? = nil
-    /// Seconds each sample covers, for the hover readout.
-    var sampleSeconds: Double = 1
+    let sampleSeconds: Double
+    /// Index where the read-back pass starts (drawn dashed); 0 = all read-back.
+    let readStart: Int?
+    /// Seconds after the earliest drive started that this drive's samples begin.
+    let offset: Double
+
+    var duration: Double { offset + Double(samples.count) * sampleSeconds }
+
+    /// Time (seconds from the graph's start) of sample `index`, at the middle of its span.
+    func time(of index: Int) -> Double { offset + (Double(index) + 0.5) * sampleSeconds }
+
+    /// Speed at any moment, interpolated between the two samples around it, so the
+    /// hover readout follows the pointer smoothly. nil before this drive started or
+    /// after its last sample.
+    func value(at seconds: Double) -> (mbps: Double, reading: Bool)? {
+        guard !samples.isEmpty, seconds >= offset, seconds <= duration else { return nil }
+        let position: Double = (seconds - offset) / max(sampleSeconds, 0.001) - 0.5
+        let clamped: Double = min(max(position, 0), Double(samples.count - 1))
+        let low: Int = Int(clamped.rounded(.down))
+        let high: Int = min(low + 1, samples.count - 1)
+        let fraction: Double = clamped - Double(low)
+        let mbps: Double = samples[low] + (samples[high] - samples[low]) * fraction
+        var reading: Bool = false
+        if let readStart { reading = clamped.rounded() >= Double(readStart) }
+        return (mbps, reading)
+    }
+}
+
+/// Draws speed lines for one or more drives on a shared time axis, with a hover
+/// line and readout at the exact moment under the pointer.
+struct DigiSpeedGraph: View {
+    let series: [DigiSpeedSeries]
+    var height: CGFloat = 140
+    /// Small graphs (inside a drive card) skip the fill and show a one-line readout.
+    var compact: Bool = false
     @State private var hoverX: CGFloat?
 
-    private static let readColor = Color(red: 0.36, green: 0.72, blue: 0.95)
+    private var totalSeconds: Double { max(series.map(\.duration).max() ?? 0, 1) }
+    private var top: Double {
+        var highest: Double = 1
+        for item in series { highest = max(highest, item.samples.max() ?? 0) }
+        return highest * 1.08
+    }
 
-    private func points(in size: CGSize) -> [CGPoint] {
-        guard samples.count > 1 else { return [] }
-        let highestSample: Double = samples.max() ?? 0
-        let top: Double = max(max(peak, highestSample), 1)
-        let step: CGFloat = size.width / CGFloat(samples.count - 1)
-        let usableHeight: CGFloat = size.height - 2
+    private func points(_ item: DigiSpeedSeries, size: CGSize) -> [CGPoint] {
+        let total: Double = totalSeconds
+        let ceiling: Double = top
+        let usable: CGFloat = size.height - 4
         var result: [CGPoint] = []
-        result.reserveCapacity(samples.count)
-        for (index, value) in samples.enumerated() {
-            let fraction: CGFloat = CGFloat(min(value, top) / top)
-            let x: CGFloat = CGFloat(index) * step
-            let y: CGFloat = size.height - fraction * usableHeight - 1
+        result.reserveCapacity(item.samples.count)
+        for (index, value) in item.samples.enumerated() {
+            let x: CGFloat = CGFloat(item.time(of: index) / total) * size.width
+            let fraction: CGFloat = CGFloat(min(value, ceiling) / ceiling)
+            let y: CGFloat = size.height - 2 - fraction * usable
             result.append(CGPoint(x: x, y: y))
         }
         return result
     }
-    private func area(_ points: [CGPoint], height: CGFloat) -> Path {
+
+    private func line(_ points: ArraySlice<CGPoint>) -> Path {
+        var path = Path()
+        guard let first = points.first else { return path }
+        path.move(to: first)
+        for point in points.dropFirst() { path.addLine(to: point) }
+        return path
+    }
+
+    private func area(_ points: ArraySlice<CGPoint>, height: CGFloat) -> Path {
         var path = Path()
         guard let first = points.first, let last = points.last else { return path }
         path.move(to: CGPoint(x: first.x, y: height))
@@ -4841,94 +5626,141 @@ struct DigiSpeedSparkline: View {
         path.closeSubpath()
         return path
     }
-    private func line(_ points: [CGPoint]) -> Path {
-        var path = Path()
-        guard let first = points.first else { return path }
-        path.move(to: first)
-        for point in points.dropFirst() { path.addLine(to: point) }
-        return path
-    }
 
-    /// "2:14 in · 582 MB/s · 78 GB copied" (or "read-back … checked").
-    private func readout(at index: Int) -> String {
-        let seconds: Int = Int((Double(index + 1) * sampleSeconds).rounded())
-        let time: String = String(format: "%d:%02d", seconds / 60, seconds % 60)
-        var reading = false
-        var first = 0
-        if let readStart, index >= readStart {
-            reading = true
-            first = readStart
-        }
-        var megabytes: Double = 0
-        if first <= index {
-            for position in first...index { megabytes += samples[position] * sampleSeconds }
-        }
-        let amount: String = ByteCountFormatter.string(fromByteCount: Int64(megabytes * 1_000_000), countStyle: .file)
-        let speed: String = String(format: "%.0f MB/s", samples[index])
-        let kind: String = reading ? "read-back " : ""
-        let done: String = reading ? " checked" : " copied"
-        return time + " in · " + kind + speed + " · " + amount + done
-    }
-
-    @ViewBuilder private func graph(_ plotted: [CGPoint], height: CGFloat) -> some View {
-        let split: Int? = readStart.flatMap { $0 > 0 && $0 < plotted.count ? $0 : nil }
-        // v1.39.2: read-back from the very start (only earlier copies to check): all blue.
-        let readsOnly: Bool = readStart == 0
-        let writePoints: [CGPoint] = readsOnly ? [] : (split.map { Array(plotted[0...$0]) } ?? plotted)
-        let readPoints: [CGPoint] = readsOnly ? plotted : (split.map { Array(plotted[$0...]) } ?? [])
-        if !writePoints.isEmpty {
-            area(writePoints, height: height)
-                .fill(LinearGradient(colors: [DigiBrand.accent.opacity(0.35), DigiBrand.accent.opacity(0.04)],
-                                     startPoint: .top, endPoint: .bottom))
-            line(writePoints)
-                .stroke(DigiBrand.accent, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-        }
-        if !readPoints.isEmpty {
-            area(readPoints, height: height)
-                .fill(LinearGradient(colors: [Self.readColor.opacity(0.30), Self.readColor.opacity(0.04)],
-                                     startPoint: .top, endPoint: .bottom))
-            line(readPoints)
-                .stroke(Self.readColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-        }
-    }
-
-    @ViewBuilder private func hoverMark(_ plotted: [CGPoint], size: CGSize) -> some View {
-        if let hoverX, plotted.count > 1 {
-            let step: CGFloat = size.width / CGFloat(plotted.count - 1)
-            let raw: Int = Int((hoverX / max(step, 0.001)).rounded())
-            let index: Int = min(plotted.count - 1, max(0, raw))
-            let point: CGPoint = plotted[index]
-            let label: String = readout(at: index)
-            Path { path in
-                path.move(to: CGPoint(x: point.x, y: 0))
-                path.addLine(to: CGPoint(x: point.x, y: size.height))
+    @ViewBuilder private func drawSeries(_ item: DigiSpeedSeries, size: CGSize) -> some View {
+        let plotted: [CGPoint] = points(item, size: size)
+        if plotted.count > 1 {
+            let split: Int = min(max(item.readStart ?? plotted.count, 0), plotted.count)
+            // v1.46.6: a drive that started with the graph begins at the left edge (the first
+            // sample sits half a sample in, which left a gap).
+            let lead: [CGPoint] = item.offset == 0 ? [CGPoint(x: 0, y: plotted[0].y)] : []
+            let copyPart: ArraySlice<CGPoint> = ArraySlice(lead + Array(plotted[0..<min(split + 1, plotted.count)]))
+            let readStartIndex: Int = min(split, plotted.count - 1)
+            let readLead: [CGPoint] = readStartIndex == 0 ? lead : []
+            let readPart: ArraySlice<CGPoint> = ArraySlice(readLead + Array(plotted[readStartIndex..<plotted.count]))
+            if series.count == 1 && !compact {
+                area(plotted[0..<plotted.count], height: size.height)
+                    .fill(LinearGradient(colors: [item.color.opacity(0.28), item.color.opacity(0.03)],
+                                         startPoint: .top, endPoint: .bottom))
             }
-            .stroke(Color.primary.opacity(0.35), lineWidth: 1)
-            Circle().fill(Color.primary).frame(width: 6, height: 6).position(point)
-            Text(label)
+            if split > 0 {
+                line(copyPart).stroke(item.color, style: StrokeStyle(lineWidth: compact ? 1.5 : 2, lineCap: .round, lineJoin: .round))
+            }
+            if split < plotted.count {
+                line(readPart).stroke(item.color, style: StrokeStyle(lineWidth: compact ? 1.5 : 2, lineCap: .round, lineJoin: .round, dash: [6, 4]))
+            }
+        }
+    }
+
+    private func clock(_ seconds: Double) -> String {
+        let whole: Int = max(0, Int(seconds.rounded()))
+        if whole >= 3600 { return String(format: "%d:%02d:%02d", whole / 3600, (whole % 3600) / 60, whole % 60) }
+        return String(format: "%d:%02d", whole / 60, whole % 60)
+    }
+
+    /// One drive's speed at the hovered moment.
+    private struct Reading: Identifiable {
+        let id: String
+        let name: String
+        let color: Color
+        let mbps: Double
+        let reading: Bool
+    }
+
+    private func readings(at seconds: Double) -> [Reading] {
+        var result: [Reading] = []
+        for item in series {
+            guard let found = item.value(at: seconds) else { continue }
+            result.append(Reading(id: item.id, name: item.name, color: item.color, mbps: found.mbps, reading: found.reading))
+        }
+        return result
+    }
+
+    private func dotY(_ mbps: Double, height: CGFloat) -> CGFloat {
+        let ceiling: Double = top
+        let fraction: CGFloat = CGFloat(min(mbps, ceiling) / ceiling)
+        let usable: CGFloat = height - 4
+        return height - 2 - fraction * usable
+    }
+
+    private func readoutX(_ x: CGFloat, width: CGFloat) -> CGFloat {
+        let half: CGFloat = 110
+        if x > width * 0.6 { return max(x - half, half) }
+        return min(x + half, max(half, width - half))
+    }
+
+    @ViewBuilder private func hoverLayer(size: CGSize) -> some View {
+        if let hoverX, size.width > 0 {
+            let x: CGFloat = min(max(hoverX, 0), size.width)
+            let seconds: Double = Double(x / size.width) * totalSeconds
+            let found: [Reading] = readings(at: seconds)
+            Path { path in
+                path.move(to: CGPoint(x: x, y: 0))
+                path.addLine(to: CGPoint(x: x, y: size.height))
+            }
+            .stroke(Color.primary.opacity(0.5), lineWidth: 1)
+            ForEach(found) { reading in
+                Circle().fill(reading.color).frame(width: 7, height: 7)
+                    .position(x: x, y: dotY(reading.mbps, height: size.height))
+            }
+            readoutBox(seconds: seconds, readings: found)
+                .fixedSize()
+                .position(x: readoutX(x, width: size.width), y: compact ? 10 : 44)
+        }
+    }
+
+    private func compactText(_ seconds: Double, _ readings: [Reading]) -> String {
+        guard let first = readings.first else { return clock(seconds) + " in · not running" }
+        let speed: String = String(format: "%.0f MB/s", first.mbps)
+        return clock(seconds) + " in · " + speed + (first.reading ? " reading back" : " copying")
+    }
+
+    @ViewBuilder private func readoutBox(seconds: Double, readings: [Reading]) -> some View {
+        if compact {
+            Text(compactText(seconds, readings))
                 .font(.caption2.monospacedDigit())
                 .padding(.horizontal, 6).padding(.vertical, 3)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
-                .fixedSize()
-                .position(x: min(max(point.x, 110), max(110, size.width - 110)), y: 12)
+        } else {
+            let combined: Double = readings.reduce(0.0) { $0 + $1.mbps }
+            let title: String = clock(seconds) + " in" + (readings.count > 1 ? String(format: " · %.0f MB/s combined", combined) : "")
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.caption.weight(.semibold).monospacedDigit())
+                ForEach(readings) { reading in
+                    HStack(spacing: 6) {
+                        Capsule().fill(reading.color).frame(width: 12, height: 4)
+                        Text(reading.name).lineLimit(1)
+                        Text(String(format: "%.0f MB/s", reading.mbps)).monospacedDigit().foregroundStyle(reading.color)
+                        Text(reading.reading ? "reading back" : "copying").foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+                }
+                if readings.isEmpty {
+                    Text("No drive was copying at this moment").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
         }
     }
 
     var body: some View {
         GeometryReader { geometry in
-            let plotted = points(in: geometry.size)
             ZStack {
-                RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.08))
-                if plotted.isEmpty {
-                    Text("Speed graph appears once copying starts")
-                        .font(.caption2).foregroundStyle(.tertiary)
+                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(compact ? 0.05 : 0.08))
+                if series.allSatisfy({ $0.samples.count < 2 }) {
+                    if !compact {
+                        Text("The speed graph appears once copying starts")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
                 } else {
-                    graph(plotted, height: geometry.size.height)
-                    hoverMark(plotted, size: geometry.size)
+                    ForEach(series) { item in drawSeries(item, size: geometry.size) }
+                    hoverLayer(size: geometry.size)
                 }
             }
             .contentShape(Rectangle())
-            // v1.27: hover anywhere on the graph to read the speed at that moment.
+            // v1.46: follows the pointer continuously across the whole width; the
+            // readout is interpolated between samples (1.45 snapped to the nearest one).
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location): hoverX = location.x
@@ -4938,6 +5770,26 @@ struct DigiSpeedSparkline: View {
         }
         .frame(height: height)
         .accessibilityLabel("Transfer speed graph")
+    }
+}
+
+/// v1.46.6: a progress bar in an exact color (ProgressView's tint renders darker).
+struct DigiColorBar: View {
+    let fraction: Double
+    let color: Color
+    var height: CGFloat = 6
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.18))
+                Capsule().fill(color)
+                    .frame(width: max(0, min(1, fraction)) * geometry.size.width)
+            }
+        }
+        .frame(height: height)
+        .accessibilityElement()
+        .accessibilityLabel("Progress")
+        .accessibilityValue(String(format: "%.0f percent", max(0, min(1, fraction)) * 100))
     }
 }
 

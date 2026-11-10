@@ -156,18 +156,46 @@ enum MetadataSidecar {
         return folder.lastPathComponent
     }
 
+    /// v1.45: ExifTool ships inside the app (vendor/ExifTool, run with macOS's own Perl), so
+    /// nobody has to install it. Order: the app's copy, the project's copy (smoke tests),
+    /// then an installed one (Homebrew / exiftool.org) if macOS ever drops Perl.
+    static let perlPath = "/usr/bin/perl"
+
+    static func bundledExiftool() -> String? {
+        let fm = FileManager.default
+        guard fm.isExecutableFile(atPath: perlPath) else { return nil }
+        var candidates: [String] = []
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("vendor/ExifTool/exiftool").path)
+        }
+        candidates.append(URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("vendor/ExifTool/exiftool").path)
+        for path in candidates where fm.fileExists(atPath: path) { return path }
+        return nil
+    }
+
     static func exiftoolPath() -> String? {
+        if let bundled = bundledExiftool() { return bundled }
         for path in ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"] {
             if FileManager.default.isExecutableFile(atPath: path) { return path }
         }
         return nil
     }
 
+    /// A bundled copy is a Perl script: run it with /usr/bin/perl.
+    static func isScriptCopy(_ tool: String) -> Bool {
+        tool.hasSuffix("/vendor/ExifTool/exiftool")
+    }
+
     /// Runs ExifTool; returns exit code, standard output and error output.
     static func run(_ tool: String, _ args: [String]) -> (Int32, String, String) {
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: tool)
-        task.arguments = args
+        if isScriptCopy(tool) {
+            task.executableURL = URL(fileURLWithPath: perlPath)
+            task.arguments = [tool] + args
+        } else {
+            task.executableURL = URL(fileURLWithPath: tool)
+            task.arguments = args
+        }
         let out = Pipe()
         let err = Pipe()
         task.standardOutput = out
@@ -204,7 +232,8 @@ enum MetadataSidecar {
     }
 
     static func readTags(tool: String, file: URL, tags: [String]) -> [String: String] {
-        var args: [String] = ["-j", "-G1"]
+        // JSONQ quotes every value: without it ExifTool prints "2026.10" as the number 2026.1.
+        var args: [String] = ["-j", "-G1", "-api", "StructFormat=JSONQ"]
         for tag in tags { args.append("-" + tag) }
         args.append(file.path)
         let (_, out, _) = run(tool, args)
@@ -357,7 +386,7 @@ enum MetadataSidecar {
 
     /// Reads a client's .xmp into our fields. Fields we don't show are counted, not used.
     static func loadClient(_ url: URL, tool: String) -> ClientLoad {
-        let (code, out, errText) = run(tool, ["-j", "-G1", "-XMP:all", url.path])
+        let (code, out, errText) = run(tool, ["-j", "-G1", "-api", "StructFormat=JSONQ", "-XMP:all", url.path])
         if code != 0 {
             let reason: String = errText.trimmingCharacters(in: .whitespacesAndNewlines)
             return ClientLoad(values: [:], otherFields: 0, error: reason.isEmpty ? "ExifTool couldn't read that file." : reason)

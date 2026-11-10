@@ -73,7 +73,7 @@ enum DigiBrand {
     ]
     static let toolBlurbs: [String] = [
         "Your session at a glance, and what to do next.",
-        "Copy the session to your drives. Only new and changed files are copied.",
+        "Copy a folder to your drives. Only new and changed files are copied.",
         "Make a list of starred and color-tagged images.",
         "Make sure every selected image was exported.",
         "Make folders from a list, a spreadsheet or a number sequence.",

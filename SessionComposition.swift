@@ -9,7 +9,8 @@ struct SessionCompositionView: View {
     private let colors: [String: Color] = [
         "RAW Images": .blue, "JPEG Images": .purple, "Other Images": .pink,
         "Capture One Data": .orange, "Session Files": .teal,
-        "Video": .green, "Other Files": .gray
+        "Video": .green, "Audio": .mint, "Documents": .indigo, "Design Files": .yellow,
+        "Archives & Installers": .brown, "Other Files": .gray
     ]
     private func bytes(_ value: Int64) -> String { ByteCountFormatter.string(fromByteCount: value, countStyle: .file) }
     private func fraction(_ category: SessionStorageCategory) -> Double {

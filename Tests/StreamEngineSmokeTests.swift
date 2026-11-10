@@ -555,6 +555,52 @@ enum StreamEngineSmokeTests {
         try check(unrelated == "", "Older backup with nothing in common not caught")
         print("PASS (v1.40): wrong-folder check (name on record, older backups by session database or nothing in common)")
 
+        // v1.46: removal safety guard. Many tracked files leaving the source (or an empty
+        // source) holds the drive with nothing changed, until the person OKs it.
+        try check(!DigiFastBackupEngine.removalNeedsOK(removed: 50, tracked: 100, sourceFiles: 50), "50 removed (the minimum) held")
+        try check(DigiFastBackupEngine.removalNeedsOK(removed: 51, tracked: 100, sourceFiles: 49), "51 of 100 removed not held")
+        try check(!DigiFastBackupEngine.removalNeedsOK(removed: 60, tracked: 1000, sourceFiles: 940), "6% removed held")
+        try check(DigiFastBackupEngine.removalNeedsOK(removed: 3, tracked: 3, sourceFiles: 0), "Empty source not held")
+        let guardSource = fixture.appendingPathComponent("GuardSource", isDirectory: true)
+        let guardTarget = fixture.appendingPathComponent("GuardTarget", isDirectory: true)
+        try fm.createDirectory(at: guardSource.appendingPathComponent("Capture"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: guardTarget, withIntermediateDirectories: true)
+        for number in 0..<80 {
+            let url = guardSource.appendingPathComponent(String(format: "Capture/frame_%03d.raw", number))
+            try Data(repeating: UInt8(number), count: 1000 + number).write(to: url)
+            try fm.setAttributes([.modificationDate: stamp], ofItemAtPath: url.path)
+        }
+        func guardRun(_ allow: Bool) async -> SyncProgress {
+            await DigiStreamEngine.sync(source: guardSource, destination: guardTarget, archiveChanged: true, archiveRemoved: true,
+                                        filter: BackupFilter(), control: BackupControl(), verify: true, readBack: true,
+                                        allowLargeRemoval: allow, report: { _ in })
+        }
+        let guardFirst = await guardRun(false)
+        try check(guardFirst.status == DigiFastBackupEngine.completeStatus && guardFirst.completedFiles == 80, "Guard fixture didn't back up: " + guardFirst.status)
+        let guardList = guardTarget.appendingPathComponent(DigiFastBackupEngine.reportsName).appendingPathComponent(DigiBackupReport.checksumFileName)
+        let listBefore: Data? = try? Data(contentsOf: guardList)
+        for number in 0..<60 {
+            try fm.removeItem(at: guardSource.appendingPathComponent(String(format: "Capture/frame_%03d.raw", number)))
+        }
+        let held = await guardRun(false)
+        try check(held.status.hasPrefix(DigiFastBackupEngine.removalHoldPrefix) && held.heldRemovals == 60 && held.heldOf == 80, "60 of 80 removed wasn't held: " + held.status)
+        try check(fm.fileExists(atPath: guardTarget.appendingPathComponent("Capture/frame_000.raw").path), "A held drive's file was moved")
+        try check(!fm.fileExists(atPath: guardTarget.appendingPathComponent(DigiFastBackupEngine.archiveName).path), "A held drive got an archive")
+        try check((try? Data(contentsOf: guardList)) == listBefore, "A held drive's checksum list changed")
+        let approved = await guardRun(true)
+        try check(approved.status == DigiFastBackupEngine.completeStatus, "OK'd removal didn't finish: " + approved.status)
+        try check(!fm.fileExists(atPath: guardTarget.appendingPathComponent("Capture/frame_000.raw").path), "OK'd removal left the file in place")
+        let archived: [String] = (try? fm.subpathsOfDirectory(atPath: guardTarget.appendingPathComponent(DigiFastBackupEngine.archiveName).path)) ?? []
+        try check(archived.filter { $0.hasSuffix(".raw") }.count == 60, "OK'd removal didn't archive 60 files: \(archived.filter { $0.hasSuffix(".raw") }.count)")
+        for number in 60..<80 {
+            try fm.removeItem(at: guardSource.appendingPathComponent(String(format: "Capture/frame_%03d.raw", number)))
+        }
+        let emptyHeld = await guardRun(false)
+        try check(emptyHeld.status.hasPrefix(DigiFastBackupEngine.removalHoldPrefix) && emptyHeld.status.contains("empty") && emptyHeld.heldRemovals == 20, "Empty source wasn't held: " + emptyHeld.status)
+        try check(fm.fileExists(atPath: guardTarget.appendingPathComponent("Capture/frame_079.raw").path), "Empty source moved files")
+        DigiStreamEngine.flushToDrive(guardTarget, file: guardList)
+        print("PASS (v1.46): removal safety guard (holds with nothing changed, OK moves to archive, empty source held); flush")
+
         // v1.42: Metadata sidecars. Pure rules always; real ExifTool writes when it's installed.
         let metaNow = Date(timeIntervalSince1970: 1_793_000_000)
         try check(MetadataSidecar.fillIns("© {year} Jeff", session: "S1", now: metaNow).hasSuffix(" Jeff") && MetadataSidecar.fillIns("{session}", session: "S1", now: metaNow) == "S1", "Fill-ins wrong")
@@ -590,6 +636,9 @@ enum StreamEngineSmokeTests {
             try check(readA["xmp-dc:creator"] == "Jeff Wolk" && readA["xmp-dc:subject"] == "campaign, studio" && readA["xmp-getty:originalfilename"] == "A_0001.NEF", "Sidecar read-back wrong: \(readA)")
             let rawAfter = try Data(contentsOf: rawA)
             try check(rawBefore == rawAfter, "The raw itself was changed")
+            let numberLike = MetadataSidecar.stamp(raw: metaFolder.appendingPathComponent("Sub/A_0002.iiq"), tool: exiftool, values: ["XMP-photoshop:TransmissionReference": "2026.10", "XMP-dc:Title": "007"], keepExisting: true, session: "MetaSession", now: metaNow)
+            try check(numberLike.ok, "Number-like text didn't read back as written: " + numberLike.message)
+            try check(MetadataSidecar.isScriptCopy(exiftool), "Tests didn't use the bundled ExifTool: " + exiftool)
             let metaSecond = MetadataSidecar.stamp(raw: rawA, tool: exiftool, values: ["XMP-dc:Creator": "Someone Else", "XMP-photoshop:Credit": "Credit"], keepExisting: true, session: "MetaSession", now: metaNow)
             try check(metaSecond.ok && metaSecond.wrote == 1 && metaSecond.kept == 1, "Keep-existing didn't keep: " + metaSecond.message)
             let readAgain = MetadataSidecar.readTags(tool: exiftool, file: sidecarA, tags: ["XMP-dc:Creator", "XMP-photoshop:Credit"])
@@ -623,6 +672,7 @@ enum StreamEngineSmokeTests {
             let embeddedAgain = MetadataSidecar.process(file: jpegURL, tool: exiftool, values: ["XMP-dc:Creator": "Someone Else"], keepExisting: true, session: "S", embed: true, now: metaNow)
             try check(embeddedAgain.ok && embeddedAgain.wrote == 0 && embeddedAgain.kept == 1, "Keep-existing didn't protect the JPEG's Creator")
             try check(!fm.fileExists(atPath: metaFolder.appendingPathComponent("Export_0001.jpg_original").path) && !fm.fileExists(atPath: MetadataSidecar.sidecarURL(for: jpegURL).path), "Embedding left an _original or a sidecar")
+            print("PASS (v1.45): bundled ExifTool (" + exiftool + "), number-like text kept as text")
             print("PASS (v1.44): JPEG embedding (opt-in, still opens, values read back, keeps existing, no _original or sidecar)")
             print("PASS (v1.43): Capture One sections, Getty fields, {filename}, presets as .xmp")
             print("PASS (v1.42): metadata sidecars (fill-ins, lists, client .xmp, raw listing; ExifTool write, keep existing, raw untouched, no _original)")

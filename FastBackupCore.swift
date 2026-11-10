@@ -27,6 +27,13 @@ struct SyncProgress: Identifiable, Sendable {
     var peakMBps: Double = 0
     var speedSamples: [Double] = []
     var sampleSeconds: Double = 1
+    /// v1.46: when the first speed sample's span began, so drives that started at
+    /// different moments line up on one shared graph.
+    var samplesStartedAt: Date?
+    /// v1.46: removal safety guard. Files that left the source and would move to the
+    /// archive, out of how many the last backup tracked, when this drive was held.
+    var heldRemovals = 0
+    var heldOf = 0
     // Version 17: where the time went, written by the Digi Stream engine.
     var engineNote: String = ""
     // v1.25: checksums. Files copied and verified this run, and where the report went.
@@ -158,6 +165,20 @@ struct DigiSyncSourceSnapshot: Sendable {
 
 enum DigiFastBackupEngine {
     static let completeStatus = "Up to date"
+    /// v1.46: a drive held by the removal safety guard. Starts with "Skipped" so every
+    /// finished-drive check already treats it as done; nothing on the drive was changed.
+    static let removalHoldPrefix = "Skipped: Nothing changed. "
+    /// v1.46: hold a drive when more than this many files AND more than this share of
+    /// what the last backup tracked would move to the archive (or the source is empty).
+    static let removalHoldMinimumFiles = 50
+    static let removalHoldFraction = 0.25
+    static func removalNeedsOK(removed: Int, tracked: Int, sourceFiles: Int) -> Bool {
+        guard removed > 0 else { return false }
+        if sourceFiles == 0 { return true }
+        guard removed > removalHoldMinimumFiles else { return false }
+        let share: Double = Double(removed) / Double(max(1, tracked))
+        return share > removalHoldFraction
+    }
     static let manifestName = ".shootwrap-sync-manifest.json"
 
     /// v1.40: before a manual backup, does this backup folder already hold a backup of a

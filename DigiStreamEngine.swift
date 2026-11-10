@@ -64,6 +64,31 @@ enum DigiStreamEngine {
     // running (Capture One or a tether still writing it). This is not fatal:
     // the file is skipped, the rest of the backup finishes, and the skipped
     // files are reported so the next run catches them.
+    /// v1.46: removal safety guard. Thrown after planning, before anything on the drive
+    /// changes, when many tracked files left the source (or the source is empty).
+    struct RemovalHold: Error {
+        let removed: Int
+        let tracked: Int
+        let sourceEmpty: Bool
+    }
+
+    /// v1.46: push what was written out to the drive itself before saying "Up to date",
+    /// so a cable pulled right after doesn't undo the last copies (seen in test C1:
+    /// 12 files had to be copied again). sync() flushes the Mac's own buffers;
+    /// F_FULLFSYNC asks the drive to empty its write cache. Best effort: if the drive
+    /// is gone the calls just fail. Not measured yet.
+    static func flushToDrive(_ root: URL, file: URL? = nil) {
+        Darwin.sync()
+        var paths: [String] = [root.path]
+        if let file { paths.append(file.path) }
+        for path in paths {
+            let descriptor: Int32 = Darwin.open(path, O_RDONLY)
+            guard descriptor >= 0 else { continue }
+            if fcntl(descriptor, F_FULLFSYNC) != 0 { _ = fsync(descriptor) }
+            Darwin.close(descriptor)
+        }
+    }
+
     struct SourceChanged: Error {
         let relative: String
     }
@@ -483,6 +508,7 @@ enum DigiStreamEngine {
                      verify: Bool = false,
                      readBack: Bool = true,
                      gate: DigiCaptureGate? = nil,
+                     allowLargeRemoval: Bool = false,
                      availableSpace: @escaping @Sendable (URL) -> Int64? = { DigiFastBackupEngine.availableBytes($0) },
                      report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
         let fm = FileManager.default
@@ -657,6 +683,17 @@ enum DigiStreamEngine {
                 if !renames.isEmpty {
                     let moved = Set(renames.map { $0.to.relative })
                     changes = plan.changes.filter { !moved.contains($0.relative) }
+                }
+            }
+
+            // v1.46: removal safety guard. Renamed files aren't really leaving, so they
+            // don't count. Nothing on the drive has changed yet when this throws.
+            if archiveRemoved && !allowLargeRemoval {
+                let renamedFrom: Set<String> = Set(renames.map(\.from))
+                let leaving: Int = plan.removed.filter { !renamedFrom.contains($0) }.count
+                let tracked: Int = plan.manifest.files.count
+                if DigiFastBackupEngine.removalNeedsOK(removed: leaving, tracked: tracked, sourceFiles: inventory.files.count) {
+                    throw RemovalHold(removed: leaving, tracked: tracked, sourceEmpty: inventory.files.isEmpty)
                 }
             }
 
@@ -889,6 +926,7 @@ enum DigiStreamEngine {
             copyStarted = Date()
             liveStart = copyStarted; liveBytes = 0
             sampleStart = copyStarted; sampleBytes = 0
+            state.samplesStartedAt = copyStarted
             copying = !changes.isEmpty
 
             if copying {
@@ -1114,6 +1152,8 @@ enum DigiStreamEngine {
                 return fresh
             }
             if !changes.isEmpty { state.copyPhaseSeconds = Date().timeIntervalSince(copyStarted) }
+            // v1.46: copies are on the drive itself before the read-back pass starts.
+            if !changes.isEmpty || !renames.isEmpty { flushToDrive(root) }
             // v1.39: earlier copies first (carried: checksum known; adopted: hash the
             // original first), then this run's copies.
             struct ReadItem {
@@ -1244,11 +1284,25 @@ enum DigiStreamEngine {
             }
             try await control.checkpoint()
             try checkDirectory(root, device: expectedDevice)
-            try JSONEncoder().encode(current).write(to: root.appendingPathComponent(DigiFastBackupEngine.manifestName), options: .atomic)
+            let manifestURL: URL = root.appendingPathComponent(DigiFastBackupEngine.manifestName)
+            try JSONEncoder().encode(current).write(to: manifestURL, options: .atomic)
+            // v1.46: flush to the drive before saying "Up to date".
+            state.status = "Saving to the drive…"
+            await publish(force: true)
+            flushToDrive(root, file: manifestURL)
             state.finalizeSeconds += Date().timeIntervalSince(finishStarted)
             state.status = DigiFastBackupEngine.completeStatus
         } catch is CancellationError {
             state.status = "Stopped safely. Completed files retained."
+        } catch let hold as RemovalHold {
+            state.heldRemovals = hold.removed
+            state.heldOf = hold.tracked
+            let count: String = hold.removed.formatted()
+            if hold.sourceEmpty {
+                state.status = DigiFastBackupEngine.removalHoldPrefix + "The source folder is empty, so all " + count + " backed-up files would move to the archive."
+            } else {
+                state.status = DigiFastBackupEngine.removalHoldPrefix + count + " of " + hold.tracked.formatted() + " backed-up files are no longer in the source and would move to the archive."
+            }
         } catch {
             state.errorCount += 1
             state.status = "Error: " + error.localizedDescription
@@ -1271,7 +1325,8 @@ enum DigiStreamEngine {
         var listSaved = false
         // v1.25: checksum list and report on the drive, even after a stop or error,
         // so every file that was verified is on record.
-        if verify, let root = reportRoot, let device = reportDevice {
+        // v1.46: a held drive keeps its checksum list and reports exactly as they were.
+        if verify, state.heldRemovals == 0, let root = reportRoot, let device = reportDevice {
             let input = DigiBackupReport.Input(
                 source: source, destination: root, device: device, started: started, finished: Date(),
                 status: state.status, verified: verified, removed: removedThisRun,

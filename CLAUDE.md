@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.44.0 (folder `DigiFour_1_44`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.46.6 (folder `DigiFour_1_46_6`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -854,3 +854,101 @@ Jeff: use the Metadata tab later on already-processed files too. Raws still only
   apart) for the app and the DMG, after the Nov 9 Error 68 network drop. Code pushed to
   WolkPhoto/studio-session; Jeff runs release.command on his Mac and answers y to publish v1.44.0 to
   WolkPhoto/studio-session-releases.
+
+### 1.45 (Nov 10; ExifTool built in, nothing to install)
+- vendor/ExifTool = ExifTool 13.62 unmodified from github.com/exiftool/exiftool (exiftool script, lib/,
+  README, NOTICE.txt with the Perl-license note). build.command already copies vendor/ into
+  Contents/Resources, so the app carries it (~21 MB). Signed/notarized with the app (--deep).
+- MetadataSidecar.exiftoolPath: app's copy (Resources/vendor/ExifTool/exiftool), then the project's copy
+  (smoke tests run from the project folder, so GitHub's Mac now does real writes too), then Homebrew /
+  exiftool.org installs. Script copies run as /usr/bin/perl <script> (isScriptCopy). If macOS ever drops
+  Perl, an installed ExifTool still works; the Start dialog says so.
+- Found while testing ExifTool in the cloud box (Perl 5.38, ExifTool 13.62): -j prints number-like text as
+  a JSON number ("2026.10" -> 2026.1), which would have failed read-back for a Job Identifier like that.
+  readTags and loadClient now pass -api StructFormat=JSONQ (every value quoted). Verified there: Getty
+  Personality/OriginalFileName/ParentMEID, SupplementalCategories lists, empty-packet sidecar writes.
+- Smoke test (v1.45): tests use the bundled copy; "2026.10" and "007" read back exactly.
+- To update ExifTool later: replace vendor/ExifTool with a newer github.com/exiftool/exiftool checkout
+  (exiftool, lib/, README) and bump the version in NOTICE.txt.
+
+### 1.46 (Nov 10; new Backups layout, multi-drive speed graph, removal guard, flush)
+Not compiled here (no Swift toolchain). Build: the standard one-liner.
+- Backups tab rebuilt to Jeff's pick, option A on the claude.ai canvas "Studio Session Layout Options"
+  (https://claude.ai/artifact/5eR3FH7YsFh5YZJ7G22tUM, boards Main + FourDrives). Top tabs unchanged.
+  Order: status + "Checking" Off/Quick/Full verify segmented picker (replaces the Checksums menu,
+  disabled while running); FROM card (drop a folder or Choose; setSyncSource) -> arrow -> TO column
+  (one card per drive, then "Other connected drives" with Use This Drive, Refresh, Add Folder…;
+  the separate Connected Drives card and the slim source row are gone); Back Up Now / Preview What
+  Will Copy (running: Pause All / Stop All) with the explanation or overall bar; SPEED panel; then
+  Schedule and archive (unchanged). Shell subtitle
+  now "Copy a folder to your drives…". Old views (backupControlBar, backupSourceRow,
+  backupDestinationArea, connectedDrivesCard, verifyModeMenu) are left in the code, unused.
+- Colors (Jeff: mixed colors were confusing): DigiDriveColors, one color per drive by its position
+  in the list (blue, purple, teal, pink, then repeats), used for the card mark, its progress bar, its
+  mini speed line, its graph line and its hover dot/readout. Copying vs reading back = words and
+  solid vs dashed lines only. Amber = buttons/selection; green = "Up to date".
+- Drive card: color mark instead of the green drive icon; existing per-drive Pause/Resume/Stop
+  (v16 BackupControl children) stay in the header; big live MB/s ("copying" / "reading back"), the
+  drive's own small graph (DigiSpeedGraph compact), peak and sizes. Finished: average copy MB/s.
+- DigiSpeedGraph replaces DigiSpeedSparkline: any number of drives on one clock
+  (SyncProgress.samplesStartedAt, set when copying starts, lines up drives that started later).
+  Hover follows the pointer across the full width and INTERPOLATES between samples
+  (DigiSpeedSeries.value(at:)); 1.45 snapped to the nearest sample (Jeff: choppy). Readout: time,
+  combined MB/s and every drive's MB/s + copying/reading back. Speed panel header: combined MB/s now.
+- Use This Drive fix: addDiscoveredBackupDestination guarded on `root` (Home session), so with
+  "No session open" the click did nothing. Uses backupSourceForNaming; every refusal is a dialog
+  (explainCantAdd). Backups never need a Capture One session. Wording: "Matching folder found".
+- Removal safety guard (engine, after rename detection, before anything on the drive changes):
+  with "archive removed" on, if the source is empty, or more than 50 files AND more than 25% of what
+  the last backup tracked left the source (renames don't count), the drive throws RemovalHold:
+  status "Skipped: Nothing changed. N of M backed-up files are no longer in the source…"
+  (DigiFastBackupEngine.removalHoldPrefix; starting with "Skipped" keeps every finished-drive check
+  working), heldRemovals/heldOf, no report or checksum-list write. Manual backup: after the run, an
+  NSAlert per held drive (Cancel default on Return, Continue) -> approvedRemovals -> startSync again
+  with allowLargeRemoval for those drives (one run). Scheduled: counts in the failure dialog, wording
+  names the drive; the same hold (drive + count) alerts once (heldAlerted). Card: orange line +
+  Review… button.
+- Flush (C1 lesson: 12 committed files reverted after a yank): DigiStreamEngine.flushToDrive =
+  sync() + F_FULLFSYNC on the destination folder (and the manifest), after the copy phase and
+  before "Up to date" (status "Saving to the drive…"). Speed cost not measured. Test: unplug
+  right after "Up to date", reconnect, Back Up: expect 0 copied.
+- Smoke test (v1.46): guard thresholds; 60 of 80 removed held (files, archive and checksum list
+  untouched), OK'd run archives 60, empty source held; flushToDrive runs.
+- Speed comparison vs Mirror (Nov 10, 92.14 GB / 11,264 files, 2 TB APFS "speedtester", 10 Gb/s,
+  formatted between runs, one run each): Mirror sync 2:49-2:50 (542-545 MB/s) + Deep verify 2:30.5
+  = 5:19.5, + Quick verify (sizes) 8.5 s = 2:58.5; SS Full 2:03 copy (749) + 2:28 read back = 4:32;
+  SS Quick 2:03 (741); SS Off 2:06 (733). A first SS Quick run on a tired drive stalled near
+  74 MB/s for a stretch; rerun after formatting was flat. Discarded.
+- 1.46.1 (Jeff, before testing 1.46): Preview is graphical, like Home's Session composition: one
+  compact card per drive, side by side (LazyVGrid adaptive 360-460): drive color mark + drive name,
+  big "N GB to copy", files checked, a bar by file count (New green, Changed orange, Gone from the
+  source red, Unchanged gray), rows with count and size that open to the file names (first 300,
+  "…and N more"; 36,700 rows froze the window), RAW line, and an orange note when Back Up Now will
+  hit the removal guard. SyncPreviewDetail gains newBytes, modifiedBytes, tracked. FROM card border
+  is dashed only while empty, solid once a folder is chosen.
+- 1.46.2 (Jeff): the Preview section moved up, right under the Back Up Now row (above the speed
+  panel and Automatic Backups). Clicking Preview shows a card per drive at once (previewRunning,
+  previewDestinations; placeholder with a spinner, "Comparing the folder with what's already on
+  this drive…") and each fills in as soon as that drive's check is done (appended one by one).
+  While a preview runs: no Pause/Stop All, no "Backing up" label, no speed panel (syncBusy is also
+  true for previews); Back Up Now is disabled and the Preview button reads "Working Out the Preview…".
+- 1.46.3 (Jeff): FROM card, once a folder is chosen, looks like the drive cards (no border, same
+  fill) and shows what's in it, like Home's Session composition in small: folder name, ~ path, total
+  size, file count, a bar by kind and the five biggest kinds with sizes (Home's colors). Measured off
+  the main thread when the source changes (refreshSourceSummary; reuses Home's scan when it's the same
+  folder) and again after each backup run. Still takes a dropped folder. Empty: the dashed drop zone.
+  Idle summary after a run with nothing new: "Up to date: nothing new to copy" (was "Zero KB of Zero KB").
+  Note: Home's RAW blue / JPEG purple match the first two drive colors; Jeff to say if that confuses.
+- 1.46.4 (Jeff): preview rows (New / Changed / Gone from the source) open to their files grouped by
+  parent folder: folder path, file count and size (no size for files gone from the source); open a
+  folder to see EVERY file in it (LazyVStack, so big folders stay quick). The 300-name cap is gone
+  (previewFileList kept, unused). SyncPreviewFolder.group runs in the preview task, off the main thread.
+- 1.46.5 (Jeff: tidy the folder list): Capture One's own subfolders (CaptureOne/Cache/Proxies,
+  Settings1680/1690…) fold into the photo folder they belong to. Each row: the photo folder, its own
+  file count and size, and a small grey line "+ N Capture One previews and settings · size". Opened:
+  the photo files, then a "Capture One previews and settings (N)" drawer with those files.
+- 1.46.6 (Jeff): drive progress bars are drawn in the drive's exact color (DigiColorBar; the system
+  ProgressView tint rendered darker than the speed line). Speed lines start at the left edge.
+  Folder kinds for non-photo folders (SessionStorageSummary.scan, Home and the FROM card): Audio,
+  Documents, Design Files, Archives & Installers (was all "Other Files"). FROM card rows: biggest
+  kinds first, each with its top file types ("DMG · ZIP") and file count.
