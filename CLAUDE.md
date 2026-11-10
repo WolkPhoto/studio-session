@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.40.0 (folder `DigiFour_1_40`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.44.0 (folder `DigiFour_1_44`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -118,7 +118,7 @@ nearly full; compare engines on the same drive in the same state.
 - A button the user clicks must always visibly respond; if there is nothing to
   do, say why in a simple dialog that Return closes.
 - No em dashes in written replies.
-- GitHub (jsw513/studio-session): ask Jeff before every push. Day-to-day versions go out as zips
+- GitHub (WolkPhoto/studio-session, private code; WolkPhoto/studio-session-releases, public DMGs): ask Jeff before every push. Day-to-day versions go out as zips
   only; push when he says so (for example a release).
 - Keep SwiftUI body work cheap: never loop over scan results or file lists in a view body;
   cache totals when data changes (window resizes redraw constantly, see 20.10).
@@ -139,7 +139,7 @@ BACKUPS_UI_18_NOTES.md). He picks the next tab. v19 fixed Dashboard session load
 
 1. 4TB: erase as APFS (after Jeff confirms) and run a two-drive Digi Stream backup.
 2. Measure Digi Stream after a large delete on APFS (does speed hold?).
-3. Metadata Watcher: make ExifTool `_original` backups optional (requested, not built).
+3. DONE in 1.42: Metadata no longer writes into files at all (sidecar .xmp only), so no `_original` backups.
 4. Swift 6 / deprecation warning cleanup (low priority).
 
 ## Five apps (v21, Nov 2 overnight build)
@@ -733,3 +733,124 @@ during Verifying, Back Up again).
 - Smoke test (v1.40): same source nil, different source by recorded name, empty folder nil, older backup
   of another session by database name, renamed folder of the same session nil, nothing in common "".
 - Build: the standard one-liner.
+
+### 1.40.0 released (Nov 9)
+- release.command: signed (Developer ID Application: Jeff Wolk, PBK2ZBS34N), app + DMG notarized. The DMG
+  staple step failed once on a network drop to Apple's ticket server (Error 68, "network connection was
+  lost"); `xcrun stapler staple` by hand worked. spctl: accepted, Notarized Developer ID.
+- Public downloads repo created: studio-session-releases (README + release v1.40.0 with the DMG).
+  Link for people: github.com/WolkPhoto/studio-session-releases/releases/latest. GitHub refuses a
+  release on an empty repo ("Repository is empty"), hence the README.
+- Jeff renamed his GitHub account jsw513 -> WolkPhoto the same day (old links redirect until someone
+  takes the old name).
+
+### 1.41 (Nov 9; updates come from the public releases repo)
+- UPDATE_REPO.txt is now WolkPhoto/studio-session-releases (was the private jsw513/studio-session, which
+  other people's copies can't read). Check for Updates and release.command's "Publish on GitHub" step both
+  use it. No code changes. Copies of 1.40 check the old private repo, so those users install 1.41 once by hand.
+- Build: the standard one-liner.
+
+### 1.42 (Nov 10; Metadata tab rebuilt as a sidecar .xmp writer; mockup approved by Jeff)
+Why: Jeff dislikes Capture One's metadata workflow (clunky, many tabs, stacking presets). Capture One's
+export recipes already embed metadata in JPEG/TIFF, so the app only needs to get metadata INTO Capture One.
+Test (Nov 10, Capture One 16.9, Auto Sync Sidecar XMP = Load, session open): an .xmp written next to a
+NEF by ExifTool showed up in Capture One's Metadata tool on its own, no reload. Mockup: claude.ai artifact
+"Studio Session Metadata Tab".
+- MetadataSidecar.swift (new, Foundation only, in build.command AND RUN_FAST_BACKUP_TESTS): field list
+  (main 8 up front, ~23 more behind "More IPTC fields"), fill-ins {year} {date} {session}, list fields
+  (keywords etc., comma separated, written with -sep ", "), exiftoolPath, run (stdout/stderr apart),
+  jsonValues (-j -G1), stamp(raw:...) and loadClient/clientFields, listRaws (skips hidden files and
+  CaptureOne folders), signature.
+- stamp: sidecar = same base name + .xmp (what Capture One and Lightroom use). New sidecar = an empty XMP
+  packet, then ExifTool -overwrite_original adds the fields (so no *_original, and the raw is never
+  opened for writing). keepExisting (default on): fields already set in a sidecar are kept, so edits made
+  in Capture One win. Read-back after writing; a failed first write removes the stub it created.
+- Creator bug fixed: the old "Creator" label wrote XMP-photoshop:AuthorsPosition (job title). Now
+  XMP-dc:Creator; saved presets migrate (AuthorsPosition -> Creator when Creator was empty).
+- MetadataWatcherModel (rewritten): folder = the open session's Capture folder (DigiPrimaryModel.shared
+  qcCaptureFolder, else root/Capture) or a chosen folder (keys DigiSuite.metadata.*). Watching persists
+  across launches. When a folder is first seen, its existing raws are the baseline (left to "Apply to
+  Existing Frames…", which confirms first); new or changed raws get stamped once unchanged for one 2 s
+  look, up to 40 per look, off the main thread. Client .xmp: button or drop on the tab -> known fields
+  fill the form (not saved until Save); other fields counted, not used. Presets: Save, Save as New (named),
+  Delete (Cancel default). Counts: stamped / kept / problems; last 8 events shown.
+- Studio Session shows the tab again (DigiBrand.retiredTools = [] for every brand). View takes the
+  window's WrapModel (MetadataWatcherView(wrap:)) so the folder line follows the session.
+- Speed: up to 3 ExifTool runs per frame (read existing, write, read back). Not measured; "Apply to
+  Existing" on a big session may take minutes. If too slow: ExifTool -stay_open.
+- Smoke test (v1.42): fill-ins, lists, sidecar name, session name, JSON and client mapping, raw listing;
+  with ExifTool installed (Jeff's Mac): write, read back, raw byte-identical, keep-existing keeps, no
+  *_original. GitHub's Mac likely has no ExifTool, so it runs the rules only.
+- Build: the standard one-liner.
+- 1.42 built and ran on Jeff's Mac (Nov 10): watching wrote sidecars (93 stamped, 0 problems) and every
+  field showed up in the matching Capture One row (Headline, Provider = Credit, Job Identifier, Rights
+  usage terms, Creator's Job Title, contact City, etc.).
+
+### 1.43 (Nov 10; Jeff's review of 1.42)
+- Fields now use Capture One's own sections, order and labels (MetadataFields.sections): IPTC - Contact,
+  IPTC - Content, IPTC - Image, IPTC - Status, IPTC - Getty Images (new: Personality, Original Filename,
+  Parent MEID in XMP-GettyImagesGIFT), plus Keywords. Collapsible like Capture One; label column + field.
+  New fields: Supplemental Categories. Dropped: anything Capture One doesn't show there (old People in
+  Image / Original Filename-as-DocumentAncestors). resolvedValues ignores unknown tags, so nothing hidden
+  is ever written. New fill-in {filename} (the raw's name, for Original Filename).
+- ExifTool's JSON keys are matched case-insensitively (jsonValues lowercases; canonicalTag maps back).
+- Watching never starts by itself (launch resets DigiSuite.metadata.watching); Start Watching only.
+- Presets are .xmp files in ~/Documents/Studio Session/Metadata Presets (MetadataSidecar.presetsFolder);
+  any .xmp put there shows in the Presets menu. writePreset builds a fresh file beside it and swaps it in
+  (a cleared field is really gone). Presets menu, New (Empty), Save (renaming moves the old file to the
+  Trash), Save as New (asks to replace), Delete (to the Trash), Show Presets in Finder. 1.42's JSON
+  presets convert once, then the JSON is renamed "metadata-presets (moved to xmp).json".
+- "Load Client .xmp…" renamed "Load .xmp…"; loading merges into the form and says fields not in the file
+  were left as they were. Preset messages show in the Preset card, not the watcher status.
+- Jeff: "it wrote xmps when I changed capture folder, but the UI didn't change the path". Likely he set a
+  new Capture One capture folder INSIDE Capture (subfolders included), so the watched path stayed the same.
+  Now the Where card shows "Newest frames are landing in: Capture/<sub>" (lastLanding). Asked Jeff to confirm.
+- Smoke test (v1.43): sections, tag case, {filename}; with ExifTool: Getty fields written and read back,
+  preset write/read/re-save clears a removed field.
+- 1.43.1: the 1.43 smoke test caught it on Jeff's Mac (ExifTool 13.50): "XMP-GettyImagesGIFT:..." doesn't
+  exist. ExifTool's family-1 group for the Getty namespace is XMP-getty (it still writes the
+  GettyImagesGIFT namespace in the file). Tags now XMP-getty:Personality / OriginalFileName / ParentMEID.
+- 1.43.2 (Jeff): confirmed he moved Capture One's capture folder INSIDE Capture (Capture/anothercapture); the
+  landing line showed it but the path didn't. The Where card's path now follows the folder the newest
+  frame landed in when that's inside the watched folder ("Where new frames are landing"), with a note
+  that all of Capture is watched. Fields back to the 1.42 grid look (label above field, two columns),
+  keeping Capture One's sections and labels as collapsible headings. A capture folder OUTSIDE Capture
+  is not watched (would need Capture One's capture folder via AppleScript).
+- 1.43.3 (Jeff): header says the sidecar is picked up "when Preferences › Image › Auto Sync Sidecar XMP is set
+  to Load". ~5 s delay before a new frame's sidecar (and the path switch): it was the 2 s poll plus waiting
+  one more look for the raw to stop changing. The sidecar doesn't depend on the raw's contents, so a NEW
+  raw path is now stamped the first time it's seen, and the poll is 1 s. Expect about 1-2 s (not measured).
+  A raw that only changes (same path) is no longer re-stamped; it already has its sidecar.
+- 1.43.4 (Jeff: "Start Watching is broken"): it refused because no field was filled, and only said so in small
+  status text. Start now shows a dialog for each reason it can't run (no ExifTool, no field filled in, chosen
+  mode with no folder). Session mode with no session open still starts and waits for one (status says so).
+- 1.43.5: Capture One reports its capture folder: `captures of current document` (Jeff's test returned
+  "file Macintosh HD:...:Capture:idujno:"). MetadataWatcherModel.refreshCaptureOneFolder asks the RUNNING
+  Capture One (CaptureOneTarget, never launches it) via osascript at background QoS, 5 s timeout, at most
+  every 3 s (from tick and a 2 s .task loop while the tab is open). Session mode: the Where card shows
+  that folder ("Capture One's capture folder") the moment it changes; if it's outside the session's
+  Capture folder it's watched too (watchRoots), with a note. Landing-folder display kept as a fallback.
+- 1.43.5 confirmed working by Jeff (path follows Capture One's capture folder).
+- 1.43.6 (Jeff): back to the 1.42 layout with Capture One's names: up top Creator, Copyright Notice, Provider,
+  Headline, Job Identifier, Rights usage terms (grid), then Description and Keywords (MetadataFields.topTags).
+  "More IPTC fields" opens Capture One's sections (collapsible) holding the remaining fields; the top fields
+  aren't repeated there, so empty sections (Keywords) don't show.
+
+### 1.44 (Nov 10; opt-in embedding into finished images)
+Jeff: use the Metadata tab later on already-processed files too. Raws still only ever get a sidecar.
+- Toggle "Also write into JPEG, TIFF and PNG files (inside the file itself…)" (DigiSuite.metadata.embedImages,
+  default OFF). MetadataSidecar.process routes raws to stamp (sidecar) and, when on, jpg/jpeg/tif/tiff/png to
+  embedInto: refuses files that aren't writable or don't decode (ImageIO thumbnail), honors keepExisting,
+  ExifTool -overwrite_original (writes a new copy, swaps it in; no *_original), then checks the file still
+  decodes and the values read back. File date changes on purpose (no -P) so backups copy the new version.
+- Watching: new raws are stamped on first sight; new JPEG/TIFF/PNG wait until unchanged for one look (an
+  export may still be writing). Apply to Existing counts raws and images separately in its dialog.
+- Writes XMP only (no IPTC-IIM). Fine for Photo Mechanic / Adobe / Capture One; add IIM later if an older
+  agency system needs it.
+- Smoke test (v1.44): builds a real 16x16 JPEG, skip when off, embed when on, still decodes, values read back,
+  keep-existing protects Creator, no _original and no sidecar.
+- 1.44 release prep (Nov 10, Jeff: "get this version up to github and mark a release"): RELEASE_NOTES.md
+  rewritten for 1.44 (what's new since 1.40, user-facing). release.command: staple_retry (4 tries, 30 s
+  apart) for the app and the DMG, after the Nov 9 Error 68 network drop. Code pushed to
+  WolkPhoto/studio-session; Jeff runs release.command on his Mac and answers y to publish v1.44.0 to
+  WolkPhoto/studio-session-releases.

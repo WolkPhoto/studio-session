@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="1.40.0"
+VERSION="1.44.0"
 BUILD="50"
 # v1.25: where Check for Updates looks (github.com/<owner>/<repo>/releases).
 UPDATE_REPO="${UPDATE_REPO:-$(cat UPDATE_REPO.txt 2>/dev/null | tr -d '[:space:]' || true)}"
@@ -73,7 +73,7 @@ xcrun swiftc -target arm64-apple-macosx14.0 -parse-as-library -O ${SWIFT_FLAGS[@
   FastBackupCore.swift DriveCheck.swift DigiStreamEngine.swift DigiChecksum.swift DigiArchive.swift FolderPlanCore.swift \
   Brand.swift BrandKit.swift BrandMarks.swift ShellGrip.swift ShellWrap.swift ShellProof.swift ShellCart.swift ShellTally.swift \
   ShootWrap.swift SessionComposition.swift FolderMaker.swift ContactSheets.swift JobReport.swift FolderCompare.swift \
-  MetadataWatcher.swift DigiUpdater.swift BenchmarkCore.swift BackupBenchmark.swift Installer.swift DrivePermissions.swift \
+  MetadataSidecar.swift MetadataWatcher.swift DigiUpdater.swift BenchmarkCore.swift BackupBenchmark.swift Installer.swift DrivePermissions.swift \
   -o "$APP/Contents/MacOS/$APP_NAME"
 test -x "$APP/Contents/MacOS/$APP_NAME" || { echo "ERROR: $APP_NAME executable was not created" >&2; exit 1; }
 

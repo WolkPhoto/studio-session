@@ -80,7 +80,7 @@ enum DigiBrand {
         "Write up the day: what was shot, backed up and delivered.",
         "Lay out images on printable contact sheet pages.",
         "Compare the session with your backups, file by file.",
-        "Watch a folder and add metadata to new images. Beta."
+        "Add your IPTC info to every raw as a sidecar .xmp. Capture One loads it."
     ]
 
 #if BRAND_GRIP
@@ -175,13 +175,9 @@ enum DigiBrand {
     static let defaultToolOrder: [Int] = [0, 4, 1, 7, 6, 3, 2, 5, 8]
 #endif
 
-    /// v1.25: tools switched off in this app for now. Studio Session hides
-    /// Metadata until it's out of beta; its code is untouched.
-#if BRAND_GRIP
-    static let retiredTools: Set<Int> = [8]
-#else
+    /// v1.25: tools switched off in this app for now. v1.42: Studio Session's
+    /// Metadata tab is back (sidecar .xmp writer), so nothing is retired.
     static let retiredTools: Set<Int> = []
-#endif
 
     /// v1.12: the person's own order (drag to rearrange), else the default.
     static var toolOrder: [Int] { DigiToolOrder.current().filter { !retiredTools.contains($0) } }

@@ -2482,7 +2482,7 @@ struct ShootWrapView: View {
                     case 4: FolderMakerView(sessionRoot: model.root, captureFolder: model.qcCaptureFolder, outputFolder: model.deliveryFolder)
                     case 6: ContactSheetsView(sessionRoot: model.root)
                     case 7: EmptyView()
-                    case 8: MetadataWatcherView()
+                    case 8: MetadataWatcherView(wrap: model)
                     default: reports
                     }
                 }.padding(24).frame(maxWidth: .infinity, alignment: .leading)

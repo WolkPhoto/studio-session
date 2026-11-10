@@ -69,6 +69,17 @@ notarize() {  # $1 = file to submit
 }
 
 mkdir -p "$OUT"
+# v1.44: Apple's ticket server can drop the connection, or take a minute to publish a fresh
+# ticket (Nov 9: Error 68, "network connection was lost"). Try up to 4 times, 30 s apart.
+staple_retry() {
+  local target="$1" try
+  for try in 1 2 3 4; do
+    if xcrun stapler staple "$target" >>"$LOG" 2>&1; then return 0; fi
+    [ "$try" -lt 4 ] && echo "   Stapling didn't work yet (try $try of 4). Waiting 30 s..." && sleep 30
+  done
+  return 1
+}
+
 release_one() {
   local key="$1" name="$2" bundle="$3"
   local app="$PWD/$name.app"
@@ -90,7 +101,7 @@ release_one() {
   ditto -c -k --keepParent "$app" "$zip"
   notarize "$zip" || stop "Apple didn't accept $name. The reason is at the end of release_log.txt."
   rm -f "$zip"
-  xcrun stapler staple "$app" >>"$LOG" 2>&1 || stop "Couldn't staple $name."
+  staple_retry "$app" || stop "Couldn't staple $name (tried 4 times; check the internet connection and run again)."
 
   echo "   Making the DMG..."
   local stage
@@ -102,7 +113,7 @@ release_one() {
   rm -rf "$stage"
   codesign --force --timestamp --sign "$ID" "$dmg" >>"$LOG" 2>&1 || stop "Signing $name's DMG failed."
   notarize "$dmg" || stop "Apple didn't accept $name's DMG. The reason is at the end of release_log.txt."
-  xcrun stapler staple "$dmg" >>"$LOG" 2>&1 || stop "Couldn't staple $name's DMG."
+  staple_retry "$dmg" || stop "Couldn't staple $name's DMG (tried 4 times; the DMG is notarized, so you can run: xcrun stapler staple on it later)."
 
   echo "===== Gatekeeper check $name =====" >>"$LOG"
   if spctl -a -t open --context context:primary-signature -v "$dmg" >>"$LOG" 2>&1; then

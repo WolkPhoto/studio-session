@@ -1,8 +1,18 @@
-Studio Session 1.28
+Studio Session 1.44
 
-- Full verify copies at full speed, then reads every copy back and checks it. Any copy that doesn't match is copied again.
-- Renamed files (for example a batch rename in Capture One) are renamed on the backup instead of copied again.
-- New in Check: check a drive against its own checksum list, weeks later, without the original session.
-- Hover over the speed graph to see the speed, time and amount at any moment; the read-back pass is blue.
-- The last backup line shows copy speed and verify time separately.
-- The sidebar says Verifying during the read-back, and short backups no longer show an empty graph.
+New since 1.40:
+
+**Metadata tab (new)**
+- Fill in your IPTC info once (Creator, Copyright Notice, Provider, Headline, Job Identifier, Rights usage terms, Description, Keywords) and every new raw gets it as a sidecar .xmp next to it. Raw files are never changed.
+- Capture One picks the sidecar up on its own when Preferences › Image › Auto Sync Sidecar XMP is set to Load. Your export recipes then put it in every JPEG and TIFF.
+- Follows Capture One's capture folder as you switch it, and watches only when you click Start Watching.
+- Same section names and labels as Capture One, including IPTC - Getty Images. Fill-ins: {year}, {date}, {session}, {filename}.
+- Presets are .xmp files in Documents › Studio Session › Metadata Presets. Load any .xmp (for example one a client sends) with Load .xmp… or by dropping it on the tab.
+- Anything you change in Capture One is kept unless you choose otherwise. "Apply to Existing Frames…" covers frames shot before you started.
+- Optional: write the metadata into finished JPEG, TIFF and PNG files too (off unless you turn it on).
+
+**Backups**
+- A warning when a backup folder already holds a different session's backup, before anything is copied.
+- Check for Updates now looks at the public download page, so future updates reach you automatically.
+
+Needs ExifTool for the Metadata tab (free: exiftool.org, or `brew install exiftool`).

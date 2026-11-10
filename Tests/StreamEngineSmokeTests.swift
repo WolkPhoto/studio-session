@@ -1,4 +1,6 @@
 import Foundation
+import ImageIO
+import CoreGraphics
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -552,6 +554,81 @@ enum StreamEngineSmokeTests {
         let unrelated: String? = DigiFastBackupEngine.otherSourceName(source: problemSource, destination: oldBackup)
         try check(unrelated == "", "Older backup with nothing in common not caught")
         print("PASS (v1.40): wrong-folder check (name on record, older backups by session database or nothing in common)")
+
+        // v1.42: Metadata sidecars. Pure rules always; real ExifTool writes when it's installed.
+        let metaNow = Date(timeIntervalSince1970: 1_793_000_000)
+        try check(MetadataSidecar.fillIns("© {year} Jeff", session: "S1", now: metaNow).hasSuffix(" Jeff") && MetadataSidecar.fillIns("{session}", session: "S1", now: metaNow) == "S1", "Fill-ins wrong")
+        try check(MetadataSidecar.normalizedList(" a, b;c ,, ") == "a, b, c", "Keyword list not normalized")
+        try check(MetadataSidecar.sidecarURL(for: URL(fileURLWithPath: "/x/RAW_1.NEF")).path == "/x/RAW_1.xmp", "Sidecar name wrong")
+        try check(MetadataSidecar.sessionName(for: URL(fileURLWithPath: "/x/Shoot_A/Capture")) == "Shoot_A", "Session name from Capture folder wrong")
+        let resolvedMeta = MetadataSidecar.resolvedValues(["XMP-dc:Rights": "  ", "XMP-photoshop:TransmissionReference": "{session}"], session: "S1", now: metaNow)
+        try check(resolvedMeta.count == 1 && resolvedMeta["XMP-photoshop:TransmissionReference"] == "S1", "Empty fields should be left out")
+        let parsedMeta = MetadataSidecar.jsonValues("[{\"SourceFile\":\"a.xmp\",\"XMP-dc:Creator\":\"Jeff\",\"XMP-dc:Subject\":[\"a\",\"b\"],\"XMP-xmpRights:Marked\":true}]")
+        try check(parsedMeta["xmp-dc:creator"] == "Jeff" && parsedMeta["xmp-dc:subject"] == "a, b" && parsedMeta["sourcefile"] == nil, "ExifTool JSON not read right")
+        try check(MetadataFields.canonicalTag("xmp-getty:originalfilename") == "XMP-getty:OriginalFileName", "Tag case not matched")
+        try check(MetadataSidecar.fillIns("{filename}", session: "S", filename: "A_1.NEF", now: metaNow) == "A_1.NEF", "{filename} fill-in wrong")
+        try check(MetadataFields.sections.map(\.title) == ["IPTC - Contact", "IPTC - Content", "IPTC - Image", "IPTC - Status", "IPTC - Getty Images", "Keywords"], "Sections don't match Capture One")
+        let clientMeta = MetadataSidecar.clientFields(parsedMeta)
+        try check(clientMeta.values.count == 2 && clientMeta.otherFields == 1 && clientMeta.error == nil, "Client .xmp fields not mapped")
+        let metaFolder = fixture.appendingPathComponent("MetaSession/Capture", isDirectory: true)
+        try fm.createDirectory(at: metaFolder.appendingPathComponent("CaptureOne/Cache", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: metaFolder.appendingPathComponent("Sub", isDirectory: true), withIntermediateDirectories: true)
+        try Data("raw".utf8).write(to: metaFolder.appendingPathComponent("A_0001.NEF"))
+        try Data("raw".utf8).write(to: metaFolder.appendingPathComponent("Sub/A_0002.iiq"))
+        try Data("raw".utf8).write(to: metaFolder.appendingPathComponent("CaptureOne/Cache/A_0003.NEF"))
+        try Data("jpg".utf8).write(to: metaFolder.appendingPathComponent("A_0001.jpg"))
+        let metaRaws = MetadataSidecar.listRaws(in: metaFolder, recursive: true).map(\.lastPathComponent).sorted()
+        try check(metaRaws == ["A_0001.NEF", "A_0002.iiq"], "Raw listing wrong: \(metaRaws)")
+        try check(MetadataSidecar.listRaws(in: metaFolder, recursive: false).count == 1, "Top-level raw listing wrong")
+        if let exiftool = MetadataSidecar.exiftoolPath() {
+            let rawA = metaFolder.appendingPathComponent("A_0001.NEF")
+            let rawBefore = try Data(contentsOf: rawA)
+            let metaFirst = MetadataSidecar.stamp(raw: rawA, tool: exiftool, values: ["XMP-dc:Creator": "Jeff Wolk", "XMP-dc:Rights": "© {year} Jeff Wolk", "XMP-dc:Subject": "campaign, studio", "XMP-getty:OriginalFileName": "{filename}", "XMP-getty:Personality": "Ann, Bo"], keepExisting: true, session: "MetaSession", now: metaNow)
+            try check(metaFirst.ok && metaFirst.wrote == 5, "Sidecar not written: " + metaFirst.message)
+            let sidecarA = MetadataSidecar.sidecarURL(for: rawA)
+            let readA = MetadataSidecar.readTags(tool: exiftool, file: sidecarA, tags: ["XMP-dc:Creator", "XMP-dc:Subject", "XMP-getty:OriginalFileName"])
+            try check(readA["xmp-dc:creator"] == "Jeff Wolk" && readA["xmp-dc:subject"] == "campaign, studio" && readA["xmp-getty:originalfilename"] == "A_0001.NEF", "Sidecar read-back wrong: \(readA)")
+            let rawAfter = try Data(contentsOf: rawA)
+            try check(rawBefore == rawAfter, "The raw itself was changed")
+            let metaSecond = MetadataSidecar.stamp(raw: rawA, tool: exiftool, values: ["XMP-dc:Creator": "Someone Else", "XMP-photoshop:Credit": "Credit"], keepExisting: true, session: "MetaSession", now: metaNow)
+            try check(metaSecond.ok && metaSecond.wrote == 1 && metaSecond.kept == 1, "Keep-existing didn't keep: " + metaSecond.message)
+            let readAgain = MetadataSidecar.readTags(tool: exiftool, file: sidecarA, tags: ["XMP-dc:Creator", "XMP-photoshop:Credit"])
+            try check(readAgain["xmp-dc:creator"] == "Jeff Wolk" && readAgain["xmp-photoshop:credit"] == "Credit", "Existing value overwritten or new one missing")
+            let metaLeftovers = try fm.contentsOfDirectory(atPath: metaFolder.path).filter { $0.hasSuffix("_original") }
+            try check(metaLeftovers.isEmpty, "ExifTool left *_original files: \(metaLeftovers)")
+            let presetURL = fixture.appendingPathComponent("Presets/Client A.xmp")
+            let presetError = MetadataSidecar.writePreset(["XMP-dc:Creator": "Jeff Wolk", "XMP-dc:Rights": "© {year} Jeff", "XMP-dc:Subject": "a, b"], to: presetURL, tool: exiftool)
+            try check(presetError == nil, "Preset not saved: \(presetError ?? "")")
+            let presetBack = MetadataSidecar.loadClient(presetURL, tool: exiftool)
+            try check(presetBack.values["XMP-dc:Rights"] == "© {year} Jeff" && presetBack.values["XMP-dc:Subject"] == "a, b", "Preset didn't read back: \(presetBack.values)")
+            let presetAgain = MetadataSidecar.writePreset(["XMP-dc:Creator": "Jeff Wolk"], to: presetURL, tool: exiftool)
+            try check(presetAgain == nil && MetadataSidecar.loadClient(presetURL, tool: exiftool).values.count == 1, "Re-saving a preset kept a cleared field")
+            // v1.44: embedding into a real JPEG (opt-in), and skipping it when off.
+            let jpegURL = metaFolder.appendingPathComponent("Export_0001.jpg")
+            let jpegContext = CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+            jpegContext?.setFillColor(CGColor(red: 0.8, green: 0.4, blue: 0.1, alpha: 1))
+            jpegContext?.fill(CGRect(x: 0, y: 0, width: 16, height: 16))
+            if let image = jpegContext?.makeImage(), let destination = CGImageDestinationCreateWithURL(jpegURL as CFURL, "public.jpeg" as CFString, 1, nil) {
+                CGImageDestinationAddImage(destination, image, nil)
+                _ = CGImageDestinationFinalize(destination)
+            }
+            try check(MetadataSidecar.imageOpens(jpegURL), "Test JPEG wasn't made")
+            let skipped = MetadataSidecar.process(file: jpegURL, tool: exiftool, values: ["XMP-dc:Creator": "Jeff Wolk"], keepExisting: true, session: "S", embed: false, now: metaNow)
+            try check(!skipped.ok && MetadataSidecar.readTags(tool: exiftool, file: jpegURL, tags: ["XMP-dc:Creator"]).isEmpty, "JPEG was written with embedding off")
+            let embedded = MetadataSidecar.process(file: jpegURL, tool: exiftool, values: ["XMP-dc:Creator": "Jeff Wolk", "XMP-dc:Rights": "© {year} Jeff Wolk", "XMP-dc:Subject": "a, b"], keepExisting: true, session: "S", embed: true, now: metaNow)
+            try check(embedded.ok && embedded.wrote == 3, "JPEG not embedded: " + embedded.message)
+            try check(MetadataSidecar.imageOpens(jpegURL), "JPEG doesn't open after embedding")
+            let jpegRead = MetadataSidecar.readTags(tool: exiftool, file: jpegURL, tags: ["XMP-dc:Creator", "XMP-dc:Subject"])
+            try check(jpegRead["xmp-dc:creator"] == "Jeff Wolk" && jpegRead["xmp-dc:subject"] == "a, b", "Embedded values wrong: \(jpegRead)")
+            let embeddedAgain = MetadataSidecar.process(file: jpegURL, tool: exiftool, values: ["XMP-dc:Creator": "Someone Else"], keepExisting: true, session: "S", embed: true, now: metaNow)
+            try check(embeddedAgain.ok && embeddedAgain.wrote == 0 && embeddedAgain.kept == 1, "Keep-existing didn't protect the JPEG's Creator")
+            try check(!fm.fileExists(atPath: metaFolder.appendingPathComponent("Export_0001.jpg_original").path) && !fm.fileExists(atPath: MetadataSidecar.sidecarURL(for: jpegURL).path), "Embedding left an _original or a sidecar")
+            print("PASS (v1.44): JPEG embedding (opt-in, still opens, values read back, keeps existing, no _original or sidecar)")
+            print("PASS (v1.43): Capture One sections, Getty fields, {filename}, presets as .xmp")
+            print("PASS (v1.42): metadata sidecars (fill-ins, lists, client .xmp, raw listing; ExifTool write, keep existing, raw untouched, no _original)")
+        } else {
+            print("PASS (v1.42): metadata sidecar rules (ExifTool not installed here, so real writes were skipped)")
+        }
 
         print("PASS (v17): Digi Stream bytes, dates, permissions, extended attributes, empty folders, incrementals, archives, space check, mid-file and paused stop")
     }
