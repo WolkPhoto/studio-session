@@ -1,0 +1,1 @@
+Contact Sheets: background folder scan, bounded thumbnail decoding, thumbnail cache, PDF preview on demand, smaller PDF estimate sample. Not compiled on macOS.

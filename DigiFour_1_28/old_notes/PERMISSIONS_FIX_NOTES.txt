@@ -1,0 +1,7 @@
+Permission prompt mitigation:
+- Stop automatically probing all removable volumes when reopening a saved workspace.
+- Drive discovery is now explicitly triggered by Discover Drives, using mounted volume URLs.
+- Prefer an installed persistent Apple code-signing certificate instead of an ad-hoc signature on each build.
+- If the build reports ad-hoc signing, repeated macOS prompts may still occur; install an Apple Development certificate to enable persistent identity.
+- Existing Backup Sync, Folder Compare and mode-switch behavior retained.
+- macOS compilation and runtime permission behavior not tested in this environment.

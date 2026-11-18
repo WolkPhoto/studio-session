@@ -1,0 +1,18 @@
+Digi Suite: Single Inventory Backup 05
+
+Based on DigiSuite_Capture_One_Live_Sessions_LSOF (original stable baseline).
+
+Targeted change only:
+- A single source enumeration now collects files AND directories.
+- A source snapshot is shared by simultaneous destination workers when their filters match.
+- Each destination still independently checks its own metadata and manifest.
+- Removed the extra source file and directory traversals during execution.
+- Preserves the original 4 MiB copy buffer, SHA-256 copy verification, archive logic,
+  empty directory sync, pause/stop and two parallel destination workers.
+- Adds effective per-destination average speed beside status and ETA.
+- Preserves original backup filter settings; hidden-file defaults are unchanged.
+- Preview still uses its original scan path. This optimization affects actual backup execution.
+- Does not claim higher transfer rates without real-world measurement.
+
+NOTE: Not compiled on macOS in this environment. Please test on noncritical data
+before relying on it for production backups.

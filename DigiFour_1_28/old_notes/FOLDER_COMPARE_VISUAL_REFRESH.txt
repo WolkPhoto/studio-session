@@ -1,0 +1,1 @@
+Aligned fixed-height headers, folder/drive icons, metrics, compact typography and horizontal scrolling for narrow windows. Comparison logic and other tabs unchanged. Swift compilation requires macOS.

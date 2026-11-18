@@ -1,0 +1,12 @@
+Digi Suite: Parallel Destination Backup + Approved Visual UI
+
+Base: DigiSuite_Backup_Visual_Redesign (approved compact card layout)
+Engine change: two destination workers concurrently, additional destinations queued.
+The only changed application source file is ShootWrap.swift, and its diff is confined to startSync().
+Dashboard and all other tabs remain from the approved visual redesign baseline.
+
+Build from this extracted folder:
+  bash build.command
+  open -n "$(pwd)/Digi Suite.app"
+
+Please test with a small noncritical session first. SwiftUI/macOS compilation is not available in the packaging environment.

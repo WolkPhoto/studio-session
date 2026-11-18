@@ -1,0 +1,11 @@
+Contact Sheets integration update
+
+- Removed the separate Workspace Folders selection popup.
+- Workspace sidebar folders can be clicked to add their images to Contact Sheets.
+- Workspace sidebar folders can be dragged into the Contact Sheets image area.
+- Center column displays image thumbnails by default, with optional PDF preview toggle.
+- Duplicate images are ignored when adding folders repeatedly.
+- External images and PDF export remain available.
+
+Build by double-clicking 00_BUILD_DIGI_SUITE.command.
+This is an unverified development build; compile and test on macOS before distributing.

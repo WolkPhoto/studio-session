@@ -27,6 +27,13 @@ struct SyncProgress: Identifiable, Sendable {
     var peakMBps: Double = 0
     var speedSamples: [Double] = []
     var sampleSeconds: Double = 1
+    /// v1.46: when the first speed sample's span began, so drives that started at
+    /// different moments line up on one shared graph.
+    var samplesStartedAt: Date?
+    /// v1.46: removal safety guard. Files that left the source and would move to the
+    /// archive, out of how many the last backup tracked, when this drive was held.
+    var heldRemovals = 0
+    var heldOf = 0
     // Version 17: where the time went, written by the Digi Stream engine.
     var engineNote: String = ""
     // v1.25: checksums. Files copied and verified this run, and where the report went.
@@ -49,6 +56,15 @@ struct SyncProgress: Identifiable, Sendable {
     var skippedFiles = 0
     /// v1.37: files that couldn't be backed up as they are (unreadable / lock), skipped and flagged.
     var problemFiles = 0
+    /// v1.39: copies left unchecked by an earlier run (Stop, yanked drive, crash) that this
+    /// run reads back first. Their bytes are extra read-back work on top of totalBytes x 2.
+    var extraReadBytes: Int64 = 0
+    var earlierVerified = 0
+    /// v1.39: after the run, copies on this drive still waiting to be read back.
+    var pendingReadBack = 0
+    /// v1.39: the work the bar and time left cover (copy + read back with Full verify).
+    var workBytes: Int64 { readBackOn ? totalBytes * 2 + extraReadBytes : totalBytes }
+    var workDoneBytes: Int64 { readBackOn ? completedBytes + verifiedBytes : completedBytes }
     /// v1.28: how long copying took, and the read-back pass, separately.
     var copyPhaseSeconds: Double = 0
     var verifyPhaseSeconds: Double = 0
@@ -82,6 +98,9 @@ struct BackupFilter: Codable, Sendable, Equatable {
 struct SyncRecord: Codable {
     // Same schema as older builds. Values describe copy/metadata state, not hashes.
     var files: [String: String] = [:]
+    /// v1.40: the name of the folder this backup is of (older manifests don't have it;
+    /// older builds ignore it).
+    var sourceName: String?
 }
 
 final class BackupControl: @unchecked Sendable {
@@ -146,7 +165,55 @@ struct DigiSyncSourceSnapshot: Sendable {
 
 enum DigiFastBackupEngine {
     static let completeStatus = "Up to date"
+    /// v1.46: a drive held by the removal safety guard. Starts with "Skipped" so every
+    /// finished-drive check already treats it as done; nothing on the drive was changed.
+    static let removalHoldPrefix = "Skipped: Nothing changed. "
+    /// v1.46: hold a drive when more than this many files AND more than this share of
+    /// what the last backup tracked would move to the archive (or the source is empty).
+    static let removalHoldMinimumFiles = 50
+    static let removalHoldFraction = 0.25
+    static func removalNeedsOK(removed: Int, tracked: Int, sourceFiles: Int) -> Bool {
+        guard removed > 0 else { return false }
+        if sourceFiles == 0 { return true }
+        guard removed > removalHoldMinimumFiles else { return false }
+        let share: Double = Double(removed) / Double(max(1, tracked))
+        return share > removalHoldFraction
+    }
     static let manifestName = ".shootwrap-sync-manifest.json"
+
+    /// v1.40: before a manual backup, does this backup folder already hold a backup of a
+    /// DIFFERENT folder? Returns nil when it's fine (new or empty folder, same source),
+    /// the other folder's name when it's on record, or "" when it's clearly a different
+    /// folder but the name isn't known (backups made before 1.40).
+    static func otherSourceName(source: URL, destination: URL) -> String? {
+        let manifestURL = destination.appendingPathComponent(manifestName)
+        guard let data = try? Data(contentsOf: manifestURL),
+              let record = try? JSONDecoder().decode(SyncRecord.self, from: data) else { return nil }
+        let sourceName: String = source.lastPathComponent
+        if let recorded = record.sourceName {
+            return recorded == sourceName ? nil : recorded
+        }
+        let fm = FileManager.default
+        let sourceTop: [String] = (try? fm.contentsOfDirectory(atPath: source.path)) ?? []
+        // A Capture One session's database is named after the session.
+        var backedDatabase: String?
+        for key in record.files.keys where !key.contains("/") && key.hasSuffix(".cosessiondb") {
+            backedDatabase = key
+            break
+        }
+        let sourceDatabase: String? = sourceTop.first { $0.hasSuffix(".cosessiondb") }
+        if let backedDatabase, let sourceDatabase {
+            if backedDatabase == sourceDatabase { return nil }
+            return (backedDatabase as NSString).deletingPathExtension
+        }
+        // Nothing in common at the top level: clearly a different folder.
+        var backedTop = Set<String>()
+        for key in record.files.keys {
+            if let first = key.split(separator: "/").first { backedTop.insert(String(first)) }
+        }
+        if !backedTop.isEmpty && backedTop.isDisjoint(with: Set(sourceTop)) { return "" }
+        return nil
+    }
     /// v1.25: new archives go in _StudioSession_Archive. Older drives may still
     /// hold _ShootWrap_Archive; both are left out of scans and shown in the archive tools.
     static let archiveName = "_StudioSession_Archive"
@@ -258,6 +325,35 @@ enum DigiFastBackupEngine {
         }
         return DigiSyncSourceSnapshot(source: source, filter: filter, files: files, directories: directories)
     }
+    /// v1.46.7: how far a backed-up file's date may sit from the source's and still count
+    /// as the same version. Before, this was 2 s on every drive, so a session database
+    /// saved again within 2 s with the same size was reported "Up to date" while the drive
+    /// kept the old contents (Nov 11 audit #3). The window now matches what the drive can
+    /// store: APFS keeps exact dates (the backup sets them from the source), HFS+ keeps
+    /// whole seconds, and FAT/exFAT, network shares and anything unknown keep the old
+    /// 2 s window until they are measured.
+    static func dateTolerance(forFilesystem type: String) -> TimeInterval {
+        switch type {
+        case "apfs": return 0.001
+        case "hfs": return 1.0
+        default: return 2.0
+        }
+    }
+
+    static func dateTolerance(forDestination url: URL) -> TimeInterval {
+        #if canImport(Darwin)
+        var info = statfs()
+        guard statfs(url.path, &info) == 0 else { return 2.0 }
+        let capacity = MemoryLayout.size(ofValue: info.f_fstypename)
+        let type = withUnsafePointer(to: &info.f_fstypename) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { String(cString: $0) }
+        }.lowercased()
+        return dateTolerance(forFilesystem: type)
+        #else
+        return 2.0
+        #endif
+    }
+
     static func plan(source: URL, destination: URL, filter: BackupFilter = BackupFilter(), snapshot supplied: DigiSyncSourceSnapshot? = nil, control: BackupControl? = nil) throws -> (changes: [BackupEntry], unchanged: Int, removed: [String], manifest: SyncRecord) {
         try validateLocations(source: source, destination: destination)
         let inventory = try supplied ?? snapshot(source, filter: filter, control: control)
@@ -272,6 +368,7 @@ enum DigiFastBackupEngine {
         } else { prior = SyncRecord() }
         var changes: [BackupEntry] = []
         var unchanged = 0
+        let tolerance = dateTolerance(forDestination: destination)
         let keys = Set(inventory.files.map(\.relative))
         for file in inventory.files {
             try control?.checkStopped()
@@ -281,7 +378,7 @@ enum DigiFastBackupEngine {
             if attributes?[.type] as? FileAttributeType == .typeRegular,
                (attributes?[.size] as? NSNumber)?.int64Value == file.size,
                let modified = attributes?[.modificationDate] as? Date,
-               abs(file.modified.timeIntervalSince(modified)) < 2 {
+               abs(file.modified.timeIntervalSince(modified)) < tolerance {
                 unchanged += 1
             } else {
                 changes.append(BackupEntry(relative: file.relative, source: file.source, destination: target, size: file.size, modified: file.modified))

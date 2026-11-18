@@ -11,7 +11,7 @@ struct JobReportOptions {
     var size = true
     var audits = true
     var folders = true
-    var thumbnails = false
+    var thumbnails = true
 }
 
 private struct JobFolder {

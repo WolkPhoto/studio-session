@@ -1,0 +1,1 @@
+All three Folder Compare modes now display scan activity and elapsed time in minutes and seconds. Scan ETA is estimated from completed location inventories; Deep Verify retains its 15-second throughput-based hashing ETA. Quick and Standard may finish before an ETA becomes available.

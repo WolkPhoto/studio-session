@@ -9,6 +9,6 @@ benchmark_check_dir="$(mktemp -d "${TMPDIR:-/tmp}/digisuite-benchmark-check.XXXX
 trap 'rm -rf "$benchmark_check_dir"' EXIT
 xcrun swiftc -target arm64-apple-macosx14.0 -parse-as-library -O \
   -framework Foundation -framework CryptoKit \
-  BenchmarkCore.swift Tests/BenchmarkSmokeTests.swift \
+  BenchmarkCore.swift FastBackupCore.swift Tests/BenchmarkSmokeTests.swift \
   -o "$benchmark_check_dir/BenchmarkSmokeTests"
 "$benchmark_check_dir/BenchmarkSmokeTests"

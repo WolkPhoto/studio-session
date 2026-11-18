@@ -1,0 +1,8 @@
+ExifTool 13.62 by Phil Harvey (https://exiftool.org), bundled unmodified from
+https://github.com/exiftool/exiftool so Studio Session's Metadata tab works without a separate install.
+
+ExifTool is free software; you can redistribute it and/or modify it under the same terms as Perl
+itself (the Perl Artistic License or the GNU General Public License). See README in this folder.
+
+Studio Session runs it with macOS's built-in /usr/bin/perl. If an ExifTool is installed separately
+(Homebrew or exiftool.org), the bundled copy is still preferred so results match what was tested.

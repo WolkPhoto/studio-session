@@ -58,6 +58,7 @@ struct DigiBackupSnapshot {
         var speed: Double = 0
         var newest: Date? = nil
         var longest: Double? = nil
+        var stillEstimating = false
         for destination in model.backups {
             let path = destination.path
             let progress = model.syncProgress.first { $0.destination == path }
@@ -76,12 +77,10 @@ struct DigiBackupSnapshot {
                 let isComplete = progress.status == DigiFastBackupEngine.completeStatus
                 let isProblem = progress.status.hasPrefix("Error") || progress.status == "Source Unavailable" ||
                     progress.status == DigiDestinationLock.busyStatus
-                if progress.totalBytes > 0 {
+                if progress.workBytes > 0 {
                     // v1.27: Full verify counts copying and reading back, half each.
-                    var ratio = Double(progress.completedBytes) / Double(progress.totalBytes)
-                    if progress.readBackOn {
-                        ratio = Double(progress.completedBytes + progress.verifiedBytes) / Double(progress.totalBytes * 2)
-                    }
+                    // v1.39: plus reading back copies an earlier run left unchecked.
+                    let ratio: Double = Double(progress.workDoneBytes) / Double(progress.workBytes)
                     fraction = min(1, max(0, ratio))
                 } else if isComplete {
                     fraction = 1
@@ -104,9 +103,11 @@ struct DigiBackupSnapshot {
                 if state == .copying, let left = progress.eta {
                     driveETA = left
                     longest = max(longest ?? 0, left)
+                } else if state == .copying {
+                    stillEstimating = true   // v1.48: this drive has no fair estimate yet
                 }
-                let work: Int64 = progress.readBackOn ? progress.totalBytes * 2 : progress.totalBytes
-                let workDone: Int64 = progress.readBackOn ? progress.completedBytes + progress.verifiedBytes : progress.completedBytes
+                let work: Int64 = progress.workBytes
+                let workDone: Int64 = progress.workDoneBytes
                 total += work
                 done += min(workDone, work)
                 speed += mbps
@@ -122,7 +123,8 @@ struct DigiBackupSnapshot {
         var overall: Double = 0
         if total > 0 { overall = Double(done) / Double(total) }
         return DigiBackupSnapshot(running: model.syncBusy, paused: model.everythingPaused,
-                                  fraction: overall, mbps: speed, drives: lines, lastBackup: newest, eta: longest)
+                                  fraction: overall, mbps: speed, drives: lines, lastBackup: newest,
+                                  eta: stillEstimating ? nil : longest)
     }
 }
 

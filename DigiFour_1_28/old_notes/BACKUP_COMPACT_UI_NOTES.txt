@@ -1,0 +1,1 @@
+Compact Backup Sync UI, persistent overall ETA (slowest active destination), visible progress and controls, compact destination rows, drive discovery and scheduling disclosure. Dashboard unchanged. Build on macOS with build.command.

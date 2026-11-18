@@ -211,6 +211,15 @@ struct FolderCompareView: View {
     // Never sort and split tens of thousands of paths during SwiftUI body updates.
     @State private var cachedVisibleRows: [CompareDifference] = []
     @State private var cachedSummary: (Int, Int, Int) = (0, 0, 0)
+    // Like Export Check: every missing or different file, grouped by folder.
+    @State private var cachedIssueGroups: [IssueGroup] = []
+    @State private var showIssueList = true
+    private struct IssueGroup: Identifiable {
+        let id: String            // folder path, "" for files not in a subfolder
+        var missing = 0
+        var different = 0
+        var files: [(name: String, reason: String, status: Int)] = []
+    }
     // Version 20.10: per-column totals and "has children" are worked out once
     // per scan. Before, every redraw (each step of a window resize) re-added
     // every file size and searched every result for every visible row.
@@ -243,6 +252,111 @@ struct FolderCompareView: View {
         }.sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
     }
 
+    private func locationName(_ index: Int) -> String {
+        let label = index == 0 ? "Source" : "Location \(index + 1)"
+        guard snapshots.indices.contains(index) else { return label }
+        return label + " (" + snapshots[index].root.lastPathComponent + ")"
+    }
+
+    /// Why each file is flagged, worded for people: which location lacks it,
+    /// or whether size, date or contents differ from the Source.
+    private func buildIssueGroups() -> [IssueGroup] {
+        guard snapshots.count >= 2 else { return [] }
+        var groups: [String: IssueGroup] = [:]
+        for row in results where !row.isFolder && row.status != 0 {
+            let folder = (row.id as NSString).deletingLastPathComponent
+            let name = (row.id as NSString).lastPathComponent
+            let entries = snapshots.map { $0.files[row.id] }
+            var reasons: [String] = []
+            if row.status == 2 {
+                let absent = entries.indices.filter { entries[$0] == nil }.map(locationName)
+                reasons.append("Not in " + absent.joined(separator: ", "))
+            } else if let first = entries[0] {
+                for i in entries.indices.dropFirst() {
+                    guard let other = entries[i] else { continue }
+                    if other.size != first.size {
+                        reasons.append("Size differs in \(locationName(i))")
+                    } else if abs(other.modified.timeIntervalSince(first.modified)) > 2 {
+                        reasons.append("Date differs in \(locationName(i))")
+                    } else {
+                        reasons.append("Contents differ in \(locationName(i)) (checksum)")
+                    }
+                }
+            }
+            var group = groups[folder] ?? IssueGroup(id: folder)
+            if row.status == 2 { group.missing += 1 } else { group.different += 1 }
+            group.files.append((name, reasons.joined(separator: "; "), row.status))
+            groups[folder] = group
+        }
+        return groups.values.sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    }
+
+    /// Shown under the columns once 2+ locations were compared.
+    @ViewBuilder private var issuePanel: some View {
+        if !results.isEmpty && snapshots.count >= 2 && !running {
+            let missing = cachedSummary.2, different = cachedSummary.1
+            if missing + different == 0 {
+                Label("All \(cachedSummary.0.formatted()) files match in every location.", systemImage: "checkmark.circle.fill")
+                    .font(.subheadline.bold()).foregroundStyle(.green)
+                    .padding(.vertical, 6)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label([missing > 0 ? "\(missing.formatted()) missing" : nil,
+                               different > 0 ? "\(different.formatted()) different" : nil]
+                                .compactMap { $0 }.joined(separator: " · "),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.subheadline.bold()).foregroundStyle(missing > 0 ? .red : .orange)
+                        Text("in \(cachedIssueGroups.count) folder\(cachedIssueGroups.count == 1 ? "" : "s")")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                        Spacer()
+                        Button(showIssueList ? "Hide List" : "Show List") { showIssueList.toggle() }
+                    }
+                    if showIssueList {
+                        ScrollView(.vertical) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(cachedIssueGroups) { group in
+                                    DisclosureGroup {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            ForEach(Array(group.files.prefix(500).enumerated()), id: \.offset) { _, file in
+                                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                                    Circle().fill(color(file.status)).frame(width: 6, height: 6)
+                                                    Text(file.name).font(.system(.caption, design: .monospaced))
+                                                    Text(file.reason).font(.caption).foregroundStyle(.secondary)
+                                                }
+                                                .textSelection(.enabled)
+                                            }
+                                            if group.files.count > 500 {
+                                                Text("+ \(group.files.count - 500) more. Use Export Report… for the full list.")
+                                                    .font(.caption).foregroundStyle(.secondary)
+                                            }
+                                        }.padding(.vertical, 5)
+                                    } label: {
+                                        HStack {
+                                            Text(group.id.isEmpty ? "Files (not in a subfolder)" : group.id)
+                                                .font(.subheadline.bold()).textSelection(.enabled)
+                                            Spacer()
+                                            if group.missing > 0 {
+                                                Text("\(group.missing) missing").font(.caption.bold()).foregroundStyle(color(2))
+                                            }
+                                            if group.different > 0 {
+                                                Text("\(group.different) different").font(.caption.bold()).foregroundStyle(color(1))
+                                            }
+                                        }
+                                    }
+                                    Divider().opacity(0.25)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 220)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+        }
+    }
+
     private func rebuildSummary() {
         var counts = (0, 0, 0)
         for row in results where !row.isFolder {
@@ -254,6 +368,7 @@ struct FolderCompareView: View {
             }
         }
         cachedSummary = counts
+        cachedIssueGroups = buildIssueGroups()
 
         var columns: [ColumnTotals] = []
         for snap in snapshots {
@@ -405,6 +520,7 @@ struct FolderCompareView: View {
                 Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
+            issuePanel
             HStack(spacing: 22) {
                 legend("Match", .green, "Checked values match")
                 legend("Different", .yellow, "Size, date, or checksum differs")
@@ -617,6 +733,9 @@ struct FolderCompareView: View {
         let depth = row.id.split(separator: "/").count - 1
         let name = String(row.id.split(separator: "/").last ?? "")
         let status = statusFor(row, index: index)
+        // Green only means something once 2+ locations were compared.
+        let compared = !results.isEmpty && snapshots.count >= 2
+        let tint: Color? = status != 0 ? color(status) : (compared && exists ? color(0) : nil)
         let children = row.isFolder && cachedParentFolders.contains(row.id)
         return HStack(spacing: 4) {
             HStack(spacing: 4) {
@@ -625,7 +744,7 @@ struct FolderCompareView: View {
                         .font(.caption2).frame(width: 11)
                 } else { Color.clear.frame(width: 11, height: 11) }
                 Image(systemName: row.isFolder ? "folder.fill" : "doc")
-                    .foregroundStyle(status == 0 ? (row.isFolder ? DigiBrand.accent : Color.secondary) : color(status))
+                    .foregroundStyle(tint ?? (row.isFolder ? DigiBrand.accent : Color.secondary))
                     .frame(width: 14)
                 Text(name).lineLimit(1).truncationMode(.middle)
                     .foregroundStyle(exists ? Color.primary : Color.secondary)
@@ -649,7 +768,9 @@ struct FolderCompareView: View {
         .font(.caption).monospacedDigit()
         .padding(.horizontal, 9)
         .frame(height: 31)
-        .background(status == 0 ? Color.clear : color(status).opacity(0.18))
+        // Matches get a lighter green wash than the yellow/red problems, so
+        // problems still stand out in a mostly-green list.
+        .background(tint.map { $0.opacity(status == 0 ? 0.10 : 0.18) } ?? Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
             if row.isFolder {

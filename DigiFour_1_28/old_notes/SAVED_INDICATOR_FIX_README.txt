@@ -1,0 +1,1 @@
+Fixes green Saved indicator after workspace save. Uses deterministic sorted-key JSON fingerprint and excludes tab navigation from dirty state. Error messages remain visible independently of saved state. Based on Backup Scheduler Timer Crash Fix.

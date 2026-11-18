@@ -1,0 +1,1 @@
+Contact Sheets: wrapped filenames are the default; single-line option explicitly says truncated filename. PDF labels reserve row-specific measured space for long names. Preview panel rounded with subtle border.

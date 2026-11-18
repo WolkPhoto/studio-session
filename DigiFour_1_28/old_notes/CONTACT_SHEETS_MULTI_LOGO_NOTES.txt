@@ -1,0 +1,7 @@
+Contact Sheets update:
+- Workspace Explorer: rounded tree, folder-type tinting, selection highlighting and summary card.
+- Logos & Branding: add multiple PNG/JPEG/TIFF/PDF/SVG logo files; independently choose 6 header/footer anchor positions, width and first-page-only setting.
+- Logos are rendered into both PDF preview and exported pages; top/bottom bands reserve room so images do not overlap branding.
+- Multiple logos assigned to one anchor stack vertically within that anchor's reserved region.
+- Existing PDF and folder-selection behavior retained.
+Limitations: Very large groups of logos at one anchor shrink to fit the available band. Logos are in-memory settings and not persisted across launches. macOS build not verified in this environment.

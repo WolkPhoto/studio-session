@@ -1,0 +1,1 @@
+Changing verification mode invalidates the previous run, cancels its active Deep Verify hashing tracker, resets displayed progress, and starts the newly selected mode. Stale callbacks cannot overwrite the new mode. An old directory inventory may finish in the background but cannot update the UI. macOS build not tested.

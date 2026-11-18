@@ -1,0 +1,1 @@
+Contact Sheets: rounded workspace and preview cards, soft native panel surfaces, icon labels, improved empty state, and truthful drag/drop instructions. Existing file URL drop handler remains enabled for Finder drags; tree checkboxes remain the way to select workspace folders. PDF generation unchanged.

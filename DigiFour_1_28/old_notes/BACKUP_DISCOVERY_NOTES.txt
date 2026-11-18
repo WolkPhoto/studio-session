@@ -1,0 +1,1 @@
+Backup drive discovery checks mounted /Volumes entries, matching folders at root or one container level deep. Missing folder creation requires explicit confirmation. Existing folders require Add Destination. No automatic copying is triggered by discovery.

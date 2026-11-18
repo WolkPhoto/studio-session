@@ -1,0 +1,1 @@
+Updated macOS Dock/Finder icon: cleaned-up DS white/gold monogram with sparkles. Prebuilt DigiSuite.icns includes PNG representations 16, 32, 64, 128, 256, 512, 1024. build.command copies it into the .app Resources and sets CFBundleIconFile. The in-app dashboard wordmark remains unchanged. macOS may cache old Dock icons; quit the app and replace the previous .app bundle.\n

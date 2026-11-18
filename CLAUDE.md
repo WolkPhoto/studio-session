@@ -2,7 +2,7 @@
 
 Owner: Jeff, working photographer / digital tech (Capture One). Native macOS
 SwiftUI app, Apple Silicon, macOS 14+. Bundle ID `com.digitools.app`.
-Current version: 1.38.0 (folder `DigiFour_1_38`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
+Current version: 1.48 (folder `StudioSession_Preview_1_47_8`, made from `DigiFour_1_47_8`). One codebase; since 1.25 only Studio Session (BRAND_GRIP) is built and released. Wrap, Proof, Tally and classic code remain, unused.
 
 ## Build and test
 
@@ -118,7 +118,7 @@ nearly full; compare engines on the same drive in the same state.
 - A button the user clicks must always visibly respond; if there is nothing to
   do, say why in a simple dialog that Return closes.
 - No em dashes in written replies.
-- GitHub (jsw513/studio-session): ask Jeff before every push. Day-to-day versions go out as zips
+- GitHub (WolkPhoto/studio-session, private code; WolkPhoto/studio-session-releases, public DMGs): ask Jeff before every push. Day-to-day versions go out as zips
   only; push when he says so (for example a release).
 - Keep SwiftUI body work cheap: never loop over scan results or file lists in a view body;
   cache totals when data changes (window resizes redraw constantly, see 20.10).
@@ -139,7 +139,7 @@ BACKUPS_UI_18_NOTES.md). He picks the next tab. v19 fixed Dashboard session load
 
 1. 4TB: erase as APFS (after Jeff confirms) and run a two-drive Digi Stream backup.
 2. Measure Digi Stream after a large delete on APFS (does speed hold?).
-3. Metadata Watcher: make ExifTool `_original` backups optional (requested, not built).
+3. DONE in 1.42: Metadata no longer writes into files at all (sidecar .xmp only), so no `_original` backups.
 4. Swift 6 / deprecation warning cleanup (low priority).
 
 ## Five apps (v21, Nov 2 overnight build)
@@ -590,8 +590,7 @@ fails, made via diskutil eraseDisk). Capture One open for every test. Drives tod
   delete it, so one more locked temp piles up per run (2 after 2 runs).
 Open for 1.37+ (none built yet):
 0. DONE in 1.37: unreadable / Finder-locked source files no longer block the backup (see 1.37).
-1. Read-back/record after an interrupted run: write each checksum to the list as files commit (not at the
-   end), and have the next run finish any read-back the previous run didn't (C1/C2/C3).
+1. DONE in 1.39: read-back/record after an interrupted run (C1/C2/C3), see 1.39.
 2. After a crash, the app forgets source/destinations and says nothing about the interrupted backup (A4).
 3. Failure dialog should name the drive and reason; no "needs attention" dialog for the person's own Stop;
    "1 errors" plural; free space on the card doesn't refresh after a run.
@@ -661,3 +660,406 @@ minutes). Run time per push not measured yet; estimate 3-5 min. Without a paymen
 usage simply stops at the quota. Still: ask Jeff before every push.
 Drive tests (yanks, exFAT hardware, Capture One) can't run there; those stay on Jeff's Mac.
 
+
+### 1.39 (Nov 9; nothing copied goes unchecked after a Stop, yank or crash; found C1-C3)
+Before: a Stop or a yanked drive during the read-back pass left copies that were never read back, and
+the next run said "Up to date" without checking them; after a yank no Checksums.xxh64 was written at
+all (the list and report are written at the END of a run). Data was always right; the record wasn't.
+- Pending list `_StudioSession_Reports/.StudioSession-ReadBackPending.xxh64` (xxhsum format, hidden,
+  never counted or cleared as a report). DigiBackupReport.PendingJournal appends "<hash>  <path>" as
+  each checksummed copy commits (fsync at most every 0.5 s). At the end of a run it's rewritten
+  (writePending, atomic) to what still needs reading back: with Full, earlier + this run's copies
+  minus those read back OK; Quick/Off keep only earlier records (Quick never reads back). Empty =
+  file removed. Earlier records for files being copied or renamed this run are dropped (superseded).
+- Run marker `.StudioSession-BackupRunning` (start time) while a checksummed run is going; removed
+  once the report/list and pending list are saved. Still there at the next run = that run never
+  finished: on APFS/HFS+ every file whose status-change time (lstat st_ctime) is after the marker,
+  minus files already pending or being copied, is "adopted": original hashed, copy read back. This
+  covers pending lines a yank lost in the last half second. exFAT/FAT: skipped (ctime not reliable
+  there); the pending list alone covers it, minus that last moment.
+- Next run, Full: earlier copies are read back FIRST in the verify pass ("Verifying 3 of 180: x
+  (left from an earlier backup)"), even when nothing new needs copying. Mismatch -> repair(expected:
+  nil): fresh copy checked against the original as it is now. Quick: adopted files get the original's
+  checksum recorded; pending stays until a Full run.
+- repair() now takes expected: UInt64? and returns the fresh checksum. Verify pass forces a publish
+  right after it starts ("Verifying copies…").
+- SyncProgress: extraReadBytes (bar/ETA: workBytes = total x 2 + extra), earlierVerified,
+  pendingReadBack, workBytes/workDoneBytes (UI bar, overall bar, snapshot use these now).
+- Card: counts line "N earlier verified"; orange line when pendingReadBack > 0 and nothing is
+  running: "N copies on this drive haven't been read back yet (the backup was stopped or
+  interrupted). The next backup reads them back first." Status string unchanged (done-logic).
+- Report: lines for earlier copies verified / recorded, "Still waiting to be read back: N",
+  result "COMPLETE, but N files still waiting to be read back" when that applies. DigiBackupReport.write
+  merges earlier checksums into the list and now reads the list before its "nothing new" early return.
+- Smoke test (v1.39): journal lines read back; Stop at the read-back pass leaves 4 pending with the
+  right checksums and no marker; next run reads 4 back, says so, pending gone; quiet run after that;
+  damaged pending copy re-copied; marker + damaged file (APFS) adopted and fixed, marker cleared;
+  Quick keeps pending, Full clears it; stale pending record for a changed file dropped; list correct.
+Not compiled here (no Swift toolchain). Real check on Jeff's Mac: C1 again (yank during Verifying,
+reconnect, Back Up: it should read back the leftovers and say "N earlier verified"), and C2 (Stop
+during Verifying, Back Up again).
+- Build: the standard one-liner (Working with Jeff).
+- 1.39.1: test compile fix only (the v1.39 test reused the name `stopped`, already a BackupControl in the same test). No app or engine changes.
+- 1.39.1 built and C2 PASSED on Jeff's Mac (Nov 9): Stop during Verifying, then Back Up: 0 copied,
+  139 earlier verified, 700 unchanged, Up to date. Smoke tests passed on his Mac.
+- 1.39.2 (Jeff): a run that only reads back earlier copies drew the graph orange (readStart 0 was treated
+  as "no split") and showed "Avg 0.0 MB/s", "Copying" in the legend and "Zero KB of Zero KB". Now the
+  graph is all blue, and those copy-only bits are hidden when nothing was copied (readOnly).
+
+### Nov 9 afternoon results on 1.39.2 (Capture One open)
+- C2 PASS: Stop during Verifying (Big -> SSTest_APFS/Big_c2), Back Up: 0 copied, 139 earlier verified.
+- C1 PASS: cable pulled during Verifying (Big -> WolkPhoto1TB_A/Big_C1). Rerun: 12 copied (the last 12
+  large files had reverted: their final rename/date bookkeeping was still in memory when the cable went),
+  688 earlier verified, report "700 of 700" checksums, verify_backup PASS 700/700, no temps.
+  Lesson: a yank seconds after commits can undo them; the next run catches it. Candidate fix (not built):
+  flush the drive (like Eject does) before showing "Up to date". Jeff hasn't asked for it yet.
+- D6 PASS on SSTest_APFS/D6_c: unreadable file flagged (red line, report), locked file backed up and
+  still uchg, the two locked temps left by 1.36 swept, rerun 0 copied / same red line.
+- Mistake found: Big_C1 was still a destination, so Tricky was backed up into it and the 700 Big files
+  were moved to its archive (20.98 GB, nothing deleted). Led to 1.40.
+- Verdict given to Jeff: ready for a real job (eject before unplugging; check each card's folder).
+
+### 1.40 (Nov 9; wrong-folder warning, Jeff's wording)
+- Before a manual backup (requestStartSync, in the same detached pass as the drive check), each
+  destination is checked with DigiFastBackupEngine.otherSourceName(source:destination:):
+  manifest has sourceName (new, SyncRecord.sourceName, written by the engine with the manifest) ->
+  warn if it differs from the source folder's name; older manifests -> the top-level *.cosessiondb name
+  decides (Capture One names it after the session), else warn only when nothing at the top level is in
+  common. New/empty folder (no manifest): no warning.
+- Dialog "Folder names don't match. Continue?" lists "“Big_C1” on WolkPhoto1TB_A holds a backup of
+  “Big”. You're backing up “Tricky”." and what continuing does (archive on: other files move to the
+  archive, nothing deleted). Cancel is the default (Return); Continue goes on to the usual drive checks.
+  Shown before the slow-link / format dialog. Scheduled backups and drives joining mid-backup never prompt.
+- Smoke test (v1.40): same source nil, different source by recorded name, empty folder nil, older backup
+  of another session by database name, renamed folder of the same session nil, nothing in common "".
+- Build: the standard one-liner.
+
+### 1.40.0 released (Nov 9)
+- release.command: signed (Developer ID Application: Jeff Wolk, PBK2ZBS34N), app + DMG notarized. The DMG
+  staple step failed once on a network drop to Apple's ticket server (Error 68, "network connection was
+  lost"); `xcrun stapler staple` by hand worked. spctl: accepted, Notarized Developer ID.
+- Public downloads repo created: studio-session-releases (README + release v1.40.0 with the DMG).
+  Link for people: github.com/WolkPhoto/studio-session-releases/releases/latest. GitHub refuses a
+  release on an empty repo ("Repository is empty"), hence the README.
+- Jeff renamed his GitHub account jsw513 -> WolkPhoto the same day (old links redirect until someone
+  takes the old name).
+
+### 1.41 (Nov 9; updates come from the public releases repo)
+- UPDATE_REPO.txt is now WolkPhoto/studio-session-releases (was the private jsw513/studio-session, which
+  other people's copies can't read). Check for Updates and release.command's "Publish on GitHub" step both
+  use it. No code changes. Copies of 1.40 check the old private repo, so those users install 1.41 once by hand.
+- Build: the standard one-liner.
+
+### 1.42 (Nov 10; Metadata tab rebuilt as a sidecar .xmp writer; mockup approved by Jeff)
+Why: Jeff dislikes Capture One's metadata workflow (clunky, many tabs, stacking presets). Capture One's
+export recipes already embed metadata in JPEG/TIFF, so the app only needs to get metadata INTO Capture One.
+Test (Nov 10, Capture One 16.9, Auto Sync Sidecar XMP = Load, session open): an .xmp written next to a
+NEF by ExifTool showed up in Capture One's Metadata tool on its own, no reload. Mockup: claude.ai artifact
+"Studio Session Metadata Tab".
+- MetadataSidecar.swift (new, Foundation only, in build.command AND RUN_FAST_BACKUP_TESTS): field list
+  (main 8 up front, ~23 more behind "More IPTC fields"), fill-ins {year} {date} {session}, list fields
+  (keywords etc., comma separated, written with -sep ", "), exiftoolPath, run (stdout/stderr apart),
+  jsonValues (-j -G1), stamp(raw:...) and loadClient/clientFields, listRaws (skips hidden files and
+  CaptureOne folders), signature.
+- stamp: sidecar = same base name + .xmp (what Capture One and Lightroom use). New sidecar = an empty XMP
+  packet, then ExifTool -overwrite_original adds the fields (so no *_original, and the raw is never
+  opened for writing). keepExisting (default on): fields already set in a sidecar are kept, so edits made
+  in Capture One win. Read-back after writing; a failed first write removes the stub it created.
+- Creator bug fixed: the old "Creator" label wrote XMP-photoshop:AuthorsPosition (job title). Now
+  XMP-dc:Creator; saved presets migrate (AuthorsPosition -> Creator when Creator was empty).
+- MetadataWatcherModel (rewritten): folder = the open session's Capture folder (DigiPrimaryModel.shared
+  qcCaptureFolder, else root/Capture) or a chosen folder (keys DigiSuite.metadata.*). Watching persists
+  across launches. When a folder is first seen, its existing raws are the baseline (left to "Apply to
+  Existing Frames…", which confirms first); new or changed raws get stamped once unchanged for one 2 s
+  look, up to 40 per look, off the main thread. Client .xmp: button or drop on the tab -> known fields
+  fill the form (not saved until Save); other fields counted, not used. Presets: Save, Save as New (named),
+  Delete (Cancel default). Counts: stamped / kept / problems; last 8 events shown.
+- Studio Session shows the tab again (DigiBrand.retiredTools = [] for every brand). View takes the
+  window's WrapModel (MetadataWatcherView(wrap:)) so the folder line follows the session.
+- Speed: up to 3 ExifTool runs per frame (read existing, write, read back). Not measured; "Apply to
+  Existing" on a big session may take minutes. If too slow: ExifTool -stay_open.
+- Smoke test (v1.42): fill-ins, lists, sidecar name, session name, JSON and client mapping, raw listing;
+  with ExifTool installed (Jeff's Mac): write, read back, raw byte-identical, keep-existing keeps, no
+  *_original. GitHub's Mac likely has no ExifTool, so it runs the rules only.
+- Build: the standard one-liner.
+- 1.42 built and ran on Jeff's Mac (Nov 10): watching wrote sidecars (93 stamped, 0 problems) and every
+  field showed up in the matching Capture One row (Headline, Provider = Credit, Job Identifier, Rights
+  usage terms, Creator's Job Title, contact City, etc.).
+
+### 1.43 (Nov 10; Jeff's review of 1.42)
+- Fields now use Capture One's own sections, order and labels (MetadataFields.sections): IPTC - Contact,
+  IPTC - Content, IPTC - Image, IPTC - Status, IPTC - Getty Images (new: Personality, Original Filename,
+  Parent MEID in XMP-GettyImagesGIFT), plus Keywords. Collapsible like Capture One; label column + field.
+  New fields: Supplemental Categories. Dropped: anything Capture One doesn't show there (old People in
+  Image / Original Filename-as-DocumentAncestors). resolvedValues ignores unknown tags, so nothing hidden
+  is ever written. New fill-in {filename} (the raw's name, for Original Filename).
+- ExifTool's JSON keys are matched case-insensitively (jsonValues lowercases; canonicalTag maps back).
+- Watching never starts by itself (launch resets DigiSuite.metadata.watching); Start Watching only.
+- Presets are .xmp files in ~/Documents/Studio Session/Metadata Presets (MetadataSidecar.presetsFolder);
+  any .xmp put there shows in the Presets menu. writePreset builds a fresh file beside it and swaps it in
+  (a cleared field is really gone). Presets menu, New (Empty), Save (renaming moves the old file to the
+  Trash), Save as New (asks to replace), Delete (to the Trash), Show Presets in Finder. 1.42's JSON
+  presets convert once, then the JSON is renamed "metadata-presets (moved to xmp).json".
+- "Load Client .xmp…" renamed "Load .xmp…"; loading merges into the form and says fields not in the file
+  were left as they were. Preset messages show in the Preset card, not the watcher status.
+- Jeff: "it wrote xmps when I changed capture folder, but the UI didn't change the path". Likely he set a
+  new Capture One capture folder INSIDE Capture (subfolders included), so the watched path stayed the same.
+  Now the Where card shows "Newest frames are landing in: Capture/<sub>" (lastLanding). Asked Jeff to confirm.
+- Smoke test (v1.43): sections, tag case, {filename}; with ExifTool: Getty fields written and read back,
+  preset write/read/re-save clears a removed field.
+- 1.43.1: the 1.43 smoke test caught it on Jeff's Mac (ExifTool 13.50): "XMP-GettyImagesGIFT:..." doesn't
+  exist. ExifTool's family-1 group for the Getty namespace is XMP-getty (it still writes the
+  GettyImagesGIFT namespace in the file). Tags now XMP-getty:Personality / OriginalFileName / ParentMEID.
+- 1.43.2 (Jeff): confirmed he moved Capture One's capture folder INSIDE Capture (Capture/anothercapture); the
+  landing line showed it but the path didn't. The Where card's path now follows the folder the newest
+  frame landed in when that's inside the watched folder ("Where new frames are landing"), with a note
+  that all of Capture is watched. Fields back to the 1.42 grid look (label above field, two columns),
+  keeping Capture One's sections and labels as collapsible headings. A capture folder OUTSIDE Capture
+  is not watched (would need Capture One's capture folder via AppleScript).
+- 1.43.3 (Jeff): header says the sidecar is picked up "when Preferences › Image › Auto Sync Sidecar XMP is set
+  to Load". ~5 s delay before a new frame's sidecar (and the path switch): it was the 2 s poll plus waiting
+  one more look for the raw to stop changing. The sidecar doesn't depend on the raw's contents, so a NEW
+  raw path is now stamped the first time it's seen, and the poll is 1 s. Expect about 1-2 s (not measured).
+  A raw that only changes (same path) is no longer re-stamped; it already has its sidecar.
+- 1.43.4 (Jeff: "Start Watching is broken"): it refused because no field was filled, and only said so in small
+  status text. Start now shows a dialog for each reason it can't run (no ExifTool, no field filled in, chosen
+  mode with no folder). Session mode with no session open still starts and waits for one (status says so).
+- 1.43.5: Capture One reports its capture folder: `captures of current document` (Jeff's test returned
+  "file Macintosh HD:...:Capture:idujno:"). MetadataWatcherModel.refreshCaptureOneFolder asks the RUNNING
+  Capture One (CaptureOneTarget, never launches it) via osascript at background QoS, 5 s timeout, at most
+  every 3 s (from tick and a 2 s .task loop while the tab is open). Session mode: the Where card shows
+  that folder ("Capture One's capture folder") the moment it changes; if it's outside the session's
+  Capture folder it's watched too (watchRoots), with a note. Landing-folder display kept as a fallback.
+- 1.43.5 confirmed working by Jeff (path follows Capture One's capture folder).
+- 1.43.6 (Jeff): back to the 1.42 layout with Capture One's names: up top Creator, Copyright Notice, Provider,
+  Headline, Job Identifier, Rights usage terms (grid), then Description and Keywords (MetadataFields.topTags).
+  "More IPTC fields" opens Capture One's sections (collapsible) holding the remaining fields; the top fields
+  aren't repeated there, so empty sections (Keywords) don't show.
+
+### 1.44 (Nov 10; opt-in embedding into finished images)
+Jeff: use the Metadata tab later on already-processed files too. Raws still only ever get a sidecar.
+- Toggle "Also write into JPEG, TIFF and PNG files (inside the file itself…)" (DigiSuite.metadata.embedImages,
+  default OFF). MetadataSidecar.process routes raws to stamp (sidecar) and, when on, jpg/jpeg/tif/tiff/png to
+  embedInto: refuses files that aren't writable or don't decode (ImageIO thumbnail), honors keepExisting,
+  ExifTool -overwrite_original (writes a new copy, swaps it in; no *_original), then checks the file still
+  decodes and the values read back. File date changes on purpose (no -P) so backups copy the new version.
+- Watching: new raws are stamped on first sight; new JPEG/TIFF/PNG wait until unchanged for one look (an
+  export may still be writing). Apply to Existing counts raws and images separately in its dialog.
+- Writes XMP only (no IPTC-IIM). Fine for Photo Mechanic / Adobe / Capture One; add IIM later if an older
+  agency system needs it.
+- Smoke test (v1.44): builds a real 16x16 JPEG, skip when off, embed when on, still decodes, values read back,
+  keep-existing protects Creator, no _original and no sidecar.
+- 1.44 release prep (Nov 10, Jeff: "get this version up to github and mark a release"): RELEASE_NOTES.md
+  rewritten for 1.44 (what's new since 1.40, user-facing). release.command: staple_retry (4 tries, 30 s
+  apart) for the app and the DMG, after the Nov 9 Error 68 network drop. Code pushed to
+  WolkPhoto/studio-session; Jeff runs release.command on his Mac and answers y to publish v1.44.0 to
+  WolkPhoto/studio-session-releases.
+
+### 1.45 (Nov 10; ExifTool built in, nothing to install)
+- vendor/ExifTool = ExifTool 13.62 unmodified from github.com/exiftool/exiftool (exiftool script, lib/,
+  README, NOTICE.txt with the Perl-license note). build.command already copies vendor/ into
+  Contents/Resources, so the app carries it (~21 MB). Signed/notarized with the app (--deep).
+- MetadataSidecar.exiftoolPath: app's copy (Resources/vendor/ExifTool/exiftool), then the project's copy
+  (smoke tests run from the project folder, so GitHub's Mac now does real writes too), then Homebrew /
+  exiftool.org installs. Script copies run as /usr/bin/perl <script> (isScriptCopy). If macOS ever drops
+  Perl, an installed ExifTool still works; the Start dialog says so.
+- Found while testing ExifTool in the cloud box (Perl 5.38, ExifTool 13.62): -j prints number-like text as
+  a JSON number ("2026.10" -> 2026.1), which would have failed read-back for a Job Identifier like that.
+  readTags and loadClient now pass -api StructFormat=JSONQ (every value quoted). Verified there: Getty
+  Personality/OriginalFileName/ParentMEID, SupplementalCategories lists, empty-packet sidecar writes.
+- Smoke test (v1.45): tests use the bundled copy; "2026.10" and "007" read back exactly.
+- To update ExifTool later: replace vendor/ExifTool with a newer github.com/exiftool/exiftool checkout
+  (exiftool, lib/, README) and bump the version in NOTICE.txt.
+
+### 1.46 (Nov 10; new Backups layout, multi-drive speed graph, removal guard, flush)
+Not compiled here (no Swift toolchain). Build: the standard one-liner.
+- Backups tab rebuilt to Jeff's pick, option A on the claude.ai canvas "Studio Session Layout Options"
+  (https://claude.ai/artifact/5eR3FH7YsFh5YZJ7G22tUM, boards Main + FourDrives). Top tabs unchanged.
+  Order: status + "Checking" Off/Quick/Full verify segmented picker (replaces the Checksums menu,
+  disabled while running); FROM card (drop a folder or Choose; setSyncSource) -> arrow -> TO column
+  (one card per drive, then "Other connected drives" with Use This Drive, Refresh, Add Folder…;
+  the separate Connected Drives card and the slim source row are gone); Back Up Now / Preview What
+  Will Copy (running: Pause All / Stop All) with the explanation or overall bar; SPEED panel; then
+  Schedule and archive (unchanged). Shell subtitle
+  now "Copy a folder to your drives…". Old views (backupControlBar, backupSourceRow,
+  backupDestinationArea, connectedDrivesCard, verifyModeMenu) are left in the code, unused.
+- Colors (Jeff: mixed colors were confusing): DigiDriveColors, one color per drive by its position
+  in the list (blue, purple, teal, pink, then repeats), used for the card mark, its progress bar, its
+  mini speed line, its graph line and its hover dot/readout. Copying vs reading back = words and
+  solid vs dashed lines only. Amber = buttons/selection; green = "Up to date".
+- Drive card: color mark instead of the green drive icon; existing per-drive Pause/Resume/Stop
+  (v16 BackupControl children) stay in the header; big live MB/s ("copying" / "reading back"), the
+  drive's own small graph (DigiSpeedGraph compact), peak and sizes. Finished: average copy MB/s.
+- DigiSpeedGraph replaces DigiSpeedSparkline: any number of drives on one clock
+  (SyncProgress.samplesStartedAt, set when copying starts, lines up drives that started later).
+  Hover follows the pointer across the full width and INTERPOLATES between samples
+  (DigiSpeedSeries.value(at:)); 1.45 snapped to the nearest sample (Jeff: choppy). Readout: time,
+  combined MB/s and every drive's MB/s + copying/reading back. Speed panel header: combined MB/s now.
+- Use This Drive fix: addDiscoveredBackupDestination guarded on `root` (Home session), so with
+  "No session open" the click did nothing. Uses backupSourceForNaming; every refusal is a dialog
+  (explainCantAdd). Backups never need a Capture One session. Wording: "Matching folder found".
+- Removal safety guard (engine, after rename detection, before anything on the drive changes):
+  with "archive removed" on, if the source is empty, or more than 50 files AND more than 25% of what
+  the last backup tracked left the source (renames don't count), the drive throws RemovalHold:
+  status "Skipped: Nothing changed. N of M backed-up files are no longer in the source…"
+  (DigiFastBackupEngine.removalHoldPrefix; starting with "Skipped" keeps every finished-drive check
+  working), heldRemovals/heldOf, no report or checksum-list write. Manual backup: after the run, an
+  NSAlert per held drive (Cancel default on Return, Continue) -> approvedRemovals -> startSync again
+  with allowLargeRemoval for those drives (one run). Scheduled: counts in the failure dialog, wording
+  names the drive; the same hold (drive + count) alerts once (heldAlerted). Card: orange line +
+  Review… button.
+- Flush (C1 lesson: 12 committed files reverted after a yank): DigiStreamEngine.flushToDrive =
+  sync() + F_FULLFSYNC on the destination folder (and the manifest), after the copy phase and
+  before "Up to date" (status "Saving to the drive…"). Speed cost not measured. Test: unplug
+  right after "Up to date", reconnect, Back Up: expect 0 copied.
+- Smoke test (v1.46): guard thresholds; 60 of 80 removed held (files, archive and checksum list
+  untouched), OK'd run archives 60, empty source held; flushToDrive runs.
+- Speed comparison vs Mirror (Nov 10, 92.14 GB / 11,264 files, 2 TB APFS "speedtester", 10 Gb/s,
+  formatted between runs, one run each): Mirror sync 2:49-2:50 (542-545 MB/s) + Deep verify 2:30.5
+  = 5:19.5, + Quick verify (sizes) 8.5 s = 2:58.5; SS Full 2:03 copy (749) + 2:28 read back = 4:32;
+  SS Quick 2:03 (741); SS Off 2:06 (733). A first SS Quick run on a tired drive stalled near
+  74 MB/s for a stretch; rerun after formatting was flat. Discarded.
+- 1.46.1 (Jeff, before testing 1.46): Preview is graphical, like Home's Session composition: one
+  compact card per drive, side by side (LazyVGrid adaptive 360-460): drive color mark + drive name,
+  big "N GB to copy", files checked, a bar by file count (New green, Changed orange, Gone from the
+  source red, Unchanged gray), rows with count and size that open to the file names (first 300,
+  "…and N more"; 36,700 rows froze the window), RAW line, and an orange note when Back Up Now will
+  hit the removal guard. SyncPreviewDetail gains newBytes, modifiedBytes, tracked. FROM card border
+  is dashed only while empty, solid once a folder is chosen.
+- 1.46.2 (Jeff): the Preview section moved up, right under the Back Up Now row (above the speed
+  panel and Automatic Backups). Clicking Preview shows a card per drive at once (previewRunning,
+  previewDestinations; placeholder with a spinner, "Comparing the folder with what's already on
+  this drive…") and each fills in as soon as that drive's check is done (appended one by one).
+  While a preview runs: no Pause/Stop All, no "Backing up" label, no speed panel (syncBusy is also
+  true for previews); Back Up Now is disabled and the Preview button reads "Working Out the Preview…".
+- 1.46.3 (Jeff): FROM card, once a folder is chosen, looks like the drive cards (no border, same
+  fill) and shows what's in it, like Home's Session composition in small: folder name, ~ path, total
+  size, file count, a bar by kind and the five biggest kinds with sizes (Home's colors). Measured off
+  the main thread when the source changes (refreshSourceSummary; reuses Home's scan when it's the same
+  folder) and again after each backup run. Still takes a dropped folder. Empty: the dashed drop zone.
+  Idle summary after a run with nothing new: "Up to date: nothing new to copy" (was "Zero KB of Zero KB").
+  Note: Home's RAW blue / JPEG purple match the first two drive colors; Jeff to say if that confuses.
+- 1.46.4 (Jeff): preview rows (New / Changed / Gone from the source) open to their files grouped by
+  parent folder: folder path, file count and size (no size for files gone from the source); open a
+  folder to see EVERY file in it (LazyVStack, so big folders stay quick). The 300-name cap is gone
+  (previewFileList kept, unused). SyncPreviewFolder.group runs in the preview task, off the main thread.
+- 1.46.5 (Jeff: tidy the folder list): Capture One's own subfolders (CaptureOne/Cache/Proxies,
+  Settings1680/1690…) fold into the photo folder they belong to. Each row: the photo folder, its own
+  file count and size, and a small grey line "+ N Capture One previews and settings · size". Opened:
+  the photo files, then a "Capture One previews and settings (N)" drawer with those files.
+- 1.46.6 (Jeff): drive progress bars are drawn in the drive's exact color (DigiColorBar; the system
+  ProgressView tint rendered darker than the speed line). Speed lines start at the left edge.
+  Folder kinds for non-photo folders (SessionStorageSummary.scan, Home and the FROM card): Audio,
+  Documents, Design Files, Archives & Installers (was all "Other Files"). FROM card rows: biggest
+  kinds first, each with its top file types ("DMG · ZIP") and file count.
+- 1.46.7 (Nov 11 pre-release audit, AUDIT_REPORT.md): four release blockers fixed, each with a smoke
+  test (StreamEngineSmokeTests.auditFixes) and confirmed against the 1.46.6 engine first.
+  #1 A source file gone after the scan (C1 moves a frame to its Trash) failed the drive, because
+  checkSourceUnchanged threw a Cocoa "no such file" error. Now sourceIsGone (lstat ENOENT/ENOTDIR) maps
+  it to SourceChanged (skip); copyLarge's open and copySmall's copyfile do the same if it goes between
+  the check and the copy. #2 A large file whose size moved during copyLarge failed the drive. Now
+  SourceMovedDuringCopy(written:): the lane takes the bytes back off the progress, drops the temp and
+  skips it; repair() turns it into SourceChanged. #3 The planner's 2 s "same version" window let a
+  same-size save within 2 s stay stale ("Up to date", old contents). Now
+  DigiFastBackupEngine.dateTolerance(forDestination:): APFS 0.001 s, HFS+ 1 s, everything else
+  (exFAT, FAT, SMB, unknown) 2 s. Checked: unchanged files on APFS aren't re-copied (dates are set
+  exactly by setAttributes). #6 Checking Off left old checksums in Checksums.xxh64 for files it
+  replaced or removed, so Drive Check said "different". Now DigiBackupReport.refreshList drops them
+  (only if a list already exists; never creates one; not on a held drive). If every listed file was
+  replaced, the list ends up empty and Drive Check has nothing to pass (listed 0).
+  Also: RELEASE_NOTES.md rewritten for 1.46.7 (it still said 1.45); RUN_BENCHMARK_TESTS.command now
+  compiles (FastBackupCore.swift was missing from its file list).
+  Second audit (another agent, static only, Nov 11): three more fixed in 1.46.7, each with a smoke
+  test. F03 installer: InstallCore.swift (DigiInstallCore.replace) copies to a hidden staging bundle
+  beside the old app, checks Contents/MacOS/<CFBundleExecutable>, renames old aside, moves new in,
+  puts the old back on failure, then Trash (if the Trash refuses: "<Name> (previous version).app",
+  never deleted). Before, the old app was trashed first and a failed ditto left Applications empty.
+  InstallCore.swift is in build.command and RUN_FAST_BACKUP_TESTS.command. F02 flush: flushToDrive
+  returns a reason or nil; a failure (can't open the folder, F_FULLFSYNC and fsync both fail with a
+  real error; EINVAL/ENOTSUP/ENOTTY are ignored) throws flushFailure, so the drive shows an error,
+  not "Up to date". Checked on APFS, HFS+, exFAT and MS-DOS disk images: no false failures, and a
+  second run copies nothing (the new date windows hold on HFS+ and exFAT). F07 ExifTool:
+  MetadataSidecar.run reads stderr on another queue while stdout is read, and stops a call after
+  toolTimeout (300 s; exit 124). Second-audit points checked and not acted on: F08/F09 (release.command
+  already signs with Developer ID, fails closed, verifies, notarizes); F04 (skips already shown with a
+  warning and listed in the report); F05/F06/F11/F12 (hardening, later).
+  RUN_DRIVE_FORMAT_TESTS.command (new, Tests/DriveFormatTests.swift): makes 200 MB APFS, HFS+, exFAT and
+  MS-DOS images in a mktemp folder, mounts them there (-nobrowse -mountrandom, nothing in /Volumes),
+  backs up twice, same-size change past the window, Drive Check, Checking Off, archive, temp leftovers,
+  then detaches and removes them. Not run by build_all (it mounts images); run it by hand.
+  It found a real bug at once: on MS-DOS (FAT) the rename of the finished .shootwrap-*.tmp to its real
+  name resets the file's date to now, so every backup to a FAT drive re-copied everything (1.46.6 too).
+  Fix: keepDate(url, modified) after every move into place (commit, repair, rename detection), before
+  relock; sets the date again only if it moved > 2 s. Dates kept, measured: APFS exact, HFS+ whole
+  seconds, exFAT ~0.0005 s (so its 2 s window could be tightened to about 0.01 s after more checks),
+  FAT 2 s.
+  Third audit (Nov 11): R4 "files missing from the zip" and D5 "checksum list not atomic" are wrong
+  (all build files present; every list/report write is .atomic). D4 archive is per-file rename, safe
+  on re-run. Later: persistent "N files still need a backup" badge (D3), scan cost on huge sessions
+  (R1/P2), splitting ShootWrap.swift (R2).
+  RUN_REAL_SCENARIOS.command [drive folder] (new, Tests/RealScenarioTests.swift): Jeff's Vanish, Grow
+  and Stale tests at full size with no clicking. Backs up like WrapModel.syncFolder (DigiDestinationLock,
+  Checking mode read from `defaults read com.digitools.grip DigiSuite.verifyMode`, archive changed and
+  removed on, DigiStreamEngine.sync); a watcher thread deletes 50 of 300 photos once copying starts,
+  grows a 1 GB database by 1 MB once its temp passes 64 MB, or saves Settings.cos again 1 s later
+  (window + 0.5 s on exFAT/FAT). No argument: backs up into a temp folder, removed after. With a
+  folder: writes "Studio Session scenario test <date>" there and leaves it. Checked against the 1.46.6
+  engine: fails all three with the same errors Jeff saw in the app; 1.46.7 passes all three.
+  Fourth audit (Nov 11): no new bugs. Later: release.command should also run RUN_DRIVE_FORMAT_TESTS and
+  RUN_BENCHMARK_TESTS (Jeff: not now); PendingJournal ignores write/fsync results (run marker + adopt
+  covers a crash); wrong-folder check is by folder name only (removal guard still holds); record the
+  source's ctime per file to catch same-size, same-date rewrites (costs extra copies on tag changes).
+  Still open from the audit: #4 read-back may be served from cache on exFAT (test: copy, purge,
+  compare); #5 no barrier fsync before the temp rename; #7 archive clear not under the drive lock;
+  #8 auto-trim can delete the last copies; exFAT date window (measure its real precision, then
+  tighten from 2 s); build.command and CI don't run the smoke tests.
+
+### 1.47 (Nov 13; iPhone Remote)
+Jeff: an iPhone app to see the session's status and push a backup, on the same Wi-Fi or over cellular.
+- DigiRemote.swift (new; in build.command, links -framework Network): NWListener HTTP/1.1 + JSON on fixed
+  port 47820, Bonjour `_studiosession._tcp` (service name = Mac name). Off by default (DigiSuite.remote.enabled);
+  started from DigiWorkspaceWindow.onAppear if on. Window "iPhone Remote" (id iphone-remote), app menu item.
+  Endpoints: GET /v1/hello (no auth), POST /v1/pair {code, deviceName} (six-digit code from the window, 10 min,
+  single use, 5 wrong = closed) -> random 32-byte token, Mac stores SHA-256 only (DigiSuite.remote.devices);
+  GET /v1/status (DigiRemoteStatus from DigiBackupSnapshot + DigiNextStep + per-drive SyncProgress, lastBackups,
+  free space); POST /v1/backup {force}; /v1/pause, /v1/resume, /v1/stop. All handling hops to the main actor.
+- WrapModel.requestRemoteStart(force:from:reply:): requestStartSync's checks with NO dialogs on the Mac.
+  Folder-name mismatch -> refused (answer at the Mac). Slow link / non-APFS -> warnings back to the phone,
+  "Back Up Anyway" resends with force. Removal-guard holds still need the Mac (phone shows the held count).
+- Cellular = Tailscale (no relay, no open router ports). DigiNetworkAddresses reports Wi-Fi and 100.64/10
+  addresses; the phone gets both when pairing and tries last-good, Bonjour, Wi-Fi, typed, then Tailscale.
+- iPhone app: `iPhone Remote/` (StudioSessionRemote.xcodeproj, iOS 17, SwiftUI, bundle
+  com.digitools.studiosession.remote, team PBK2ZBS34N, display name "SS Remote"). Token in the Keychain.
+  Polls every 1.5 s while running, 4 s idle, stops in the background.
+- Checked here (Nov 13): Mac app compiles (build.command, ad-hoc signed, tests skipped); iPhone sources
+  type-check against the iOS 17.5 SDK (xcodebuild can't build: the iOS platform isn't installed in Xcode 15.4).
+  Harness with the real DigiRemoteServer + the phone's RemoteClient/Bonjour code: discovery, resolve, pair,
+  wrong code, bad token, status JSON round trip, confirm + forced start, unreachable host: all pass.
+  NOT yet run: the app on a real iPhone, the remote against a real backup, Tailscale.
+- Plain HTTP on the Wi-Fi (Tailscale is encrypted). If wanted later: TLS with a pinned self-signed cert.
+- 1.47.1 (Jeff, after updating to macOS 26 / Xcode 27.2): the window showed the toggle on but "Off";
+  nothing listened on 47820. The server only started from DigiWorkspaceWindow.onAppear, so a launch with
+  the setting already on didn't start it. Now DigiQuitDelegate.applicationDidFinishLaunching and the
+  iPhone Remote window's onAppear call startIfEnabled too. Info.plist (build.command) gains
+  NSLocalNetworkUsageDescription + NSBonjourServices (_studiosession._tcp), needed for Local Network
+  access on macOS 15+. Checked on Jeff's Mac with a separate test bundle (com.digitools.remotetest,
+  removed after): /v1/hello answers at launch, /v1/status without a token = 401, dns-sd lists the service.
+  iPhone app builds with Xcode 27.2 (generic iOS, unsigned). Jeff's first device build failed on signing
+  only (Xcode's Apple ID login rejected after the OS update).
+- 1.47.2 (Jeff: after pairing, Studio Session only showed the iPhone Remote window; "you should be able to
+  opt out"): 1.47 made iPhone Remote a separate SwiftUI Window scene, and macOS reopened only that window
+  at launch (main workspace window missing; Cmd-N brought it back). iPhone Remote is now a sheet on the
+  main window (command "iphoneRemote", shown only in the DigiPrimaryModel.shared window, Done button), so it
+  can never replace the main window. Window scene removed. Wording: optional, leave it off and nothing
+  changes; off text says paired iPhones stop working until it's turned back on (no re-pairing needed).
+  Checked with a test bundle: launch opens the 1360x1040 main window and no remote window.
+  Phone pairing screen: the address field says "Mac address, e.g. 192.168.0.215" (Bonjour didn't find the
+  Mac on Jeff's iPhone at first; typing the Wi-Fi address paired). Pair is never greyed out; it says why
+  (no Mac found -> type the address or turn on Local Network; no code). Pairing over Wi-Fi WORKED (Nov 13).
+- 1.47.3 (Jeff, Nov 13: "the phone dialogue isn't opening"): the 1.47.2 sheet only opened in the window holding DigiPrimaryModel.shared, so the menu item could silently do nothing. iPhone Remote is now `DigiRemoteWindow.show()`, an AppKit NSWindow hosting DigiRemoteView with isRestorable = false (never reopened at launch, works from any window). The sheet, its @State and the "iphoneRemote" command case are gone. Compiled; NOT yet clicked in the real app (no accessibility access from Claude).
+- 1.47.4 (Jeff, Nov 13: "I switched sessions and it didn't change on the phone"): DigiRemote served DigiPrimaryModel.shared only. Now `shownModel`: a model with a running backup, else the last key workspace window (controlActiveState == .key via noteFocused, cleared in noteClosed), else primary. iPhone App.swift: onChange(of: scenePhase, initial: true) so polling starts on cold launch. Root cause not confirmed on Jeff's Mac (couldn't see his windows); both fixes compiled, not tested live.
+- 1.47.5 (Nov 13): iPhone Remote… added to DigiMenuBarView. Jeff reported Studio Session "quits when I click the phone window" and "keeps opening and quitting". Findings: his 1.47.4 quit at 13:33:42 through Quit's keyboard path (log: performKeyEquivalent -> terminate:, no crash report). The repeated opening/quitting after that was Claude's own test copies (SS Remote Test, launched and killed during testing). In the test copy, clicks and Cmd-W in the iPhone Remote window did NOT quit. LESSON: never launch test copies of the app on Jeff's Mac while he is using it without telling him first.
+- 1.47.6 (Nov 13, Jeff: "no window popped up and I don't see anything in the menu bar"): his main window filled the screen (1728x1084 at y 33; likely full screen), and his MacBook has a notch plus iStat Menus, so the menu bar icon can be hidden. DigiRemoteWindow now does beginSheet on the front normal window (fallback: own window with moveToActiveSpace + fullScreenAuxiliary). Added DigiRemoteButton (iphone icon, orange when on) beside DigiTourButton. Compiled only; not launched (per the no-test-copies lesson).
+- 1.47.7 (Nov 13): 1.47.6 sheet WORKED (Jeff's screenshot) but the top was clipped once cards appeared and the .switch toggle drew as a blue pill with no knob. Fixes: host.sizingOptions = .preferredContentSize, view .frame(width: 540) + fixedSize vertical, no Spacer; Off|On segmented Picker. DigiRemoteDevice.deviceKey (identifierForVendor) replaces a re-paired phone's old entry; rows show paired + last connected. Phone: BonjourBrowser.blocked from .waiting(.dns(-65570 PolicyDenied)) shows an Open Settings card. Mac Bonjour advertising verified with dns-sd; Jeff's phone still showed 'Looking for Macs' (likely Local Network off). Compiled only.
+- 1.47.8 (Nov 13): 1.47.7 CRASHED opening iPhone Remote (SIGABRT, NSWindow _postWindowNeedsUpdateConstraints during NSSheetMoveHelper openSheet): NSHostingController.sizingOptions = .preferredContentSize + fixedSize on a sheet = AppKit layout loop. NEVER use preferredContentSize sizing on this sheet. Now sizingOptions = [], panel.setContentSize(540x600), view = ScrollView { content } at fixed 540x600. Verified with a test copy (Jeff told first): sheet opens 540x600, closes, reopens, no crash.
+- 1.48 (Nov 18): Midtone theme (Brand.swift BRAND_GRIP fixedTheme: bg 28292D, surface 37383D, raised 434448, line 4A4B50, text F2F2F4, subtext A3A4AA, accent 7E9AFF, good 6BD98A, warn F3CF5A) and recolored brand/grip/icon.png. Home live counts: WrapModel "Home auto-refresh" + SessionFolderWatcher (FSEvents file events, ignores CaptureOne/ folders, .cosessiondb and hidden files; paths made relative with realpath because FSEvents reports /private/var). Live adds only while lastTab == 0; full recount 2 s after quiet (max 30 s), deferred during backups; selecting Home recounts. iPhone Remote hidden behind DigiRemote.isAvailable = false (buttons, menu items and startIfEnabled); flip to true to ship. Folder Checker: green match rows (only after 2+ locations compared) and issue panel (buildIssueGroups). Export Check: SelectableFileGrid. Job Report: thumbnails default on, confirmClearJobHistory (list only; workspace files still hold their own history). Backup ETA (DigiStreamEngine publish): nil until 5 s and 10% data / 25% files (or 30 s), then max(run average, last 10 s); UI shows "Estimating…"; DigiBackupSnapshot eta nil while any copying drive is estimating. finishBackupIfIdle ignores drives removed from backups mid-run; queued drives removed before their turn are skipped.

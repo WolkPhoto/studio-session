@@ -1,0 +1,1 @@
+Contact Sheets now discovers images recursively using macOS UTType image metadata, common professional/RAW extensions, and ImageIO detection. Selection remains deduplicated. Proprietary files may be listed but require a macOS-supported decoder for previews/PDF rendering.

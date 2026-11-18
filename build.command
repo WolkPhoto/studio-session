@@ -8,8 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="1.38.0"
-BUILD="50"
+VERSION="1.48"
+BUILD="61"
 # v1.25: where Check for Updates looks (github.com/<owner>/<repo>/releases).
 UPDATE_REPO="${UPDATE_REPO:-$(cat UPDATE_REPO.txt 2>/dev/null | tr -d '[:space:]' || true)}"
 APP_NAME="${APP_NAME:-Digi Suite}"
@@ -64,16 +64,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict></array>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>DigiUpdateRepository</key><string>$UPDATE_REPO</string>
+<key>NSLocalNetworkUsageDescription</key><string>$APP_NAME lets your paired iPhone see backups and start them (iPhone Remote).</string>
+<key>NSBonjourServices</key><array><string>_studiosession._tcp</string></array>
 <key>NSAppleEventsUsageDescription</key><string>$APP_NAME reads which session Capture One has open.</string>
 </dict></plist>
 PLIST
 
 xcrun swiftc -target arm64-apple-macosx14.0 -parse-as-library -O ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"} \
-  -framework SwiftUI -framework AppKit -framework Foundation -framework CryptoKit -framework ImageIO -framework PDFKit -framework Vision \
+  -framework SwiftUI -framework AppKit -framework Foundation -framework CryptoKit -framework ImageIO -framework PDFKit -framework Vision -framework Network \
   FastBackupCore.swift DriveCheck.swift DigiStreamEngine.swift DigiChecksum.swift DigiArchive.swift FolderPlanCore.swift \
   Brand.swift BrandKit.swift BrandMarks.swift ShellGrip.swift ShellWrap.swift ShellProof.swift ShellCart.swift ShellTally.swift \
   ShootWrap.swift SessionComposition.swift FolderMaker.swift ContactSheets.swift JobReport.swift FolderCompare.swift \
-  MetadataWatcher.swift DigiUpdater.swift BenchmarkCore.swift BackupBenchmark.swift Installer.swift DrivePermissions.swift \
+  MetadataSidecar.swift MetadataWatcher.swift DigiUpdater.swift BenchmarkCore.swift BackupBenchmark.swift Installer.swift InstallCore.swift DrivePermissions.swift DigiRemote.swift \
   -o "$APP/Contents/MacOS/$APP_NAME"
 test -x "$APP/Contents/MacOS/$APP_NAME" || { echo "ERROR: $APP_NAME executable was not created" >&2; exit 1; }
 

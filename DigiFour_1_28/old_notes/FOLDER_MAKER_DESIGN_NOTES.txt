@@ -1,0 +1,1 @@
+Folder Maker redesign: Sequences first/default, Import File second, Paste & Interpret last. Consistent card styling, preview and destination actions, scrolling preview. Original Python folder engine unchanged. Not compiled on macOS.

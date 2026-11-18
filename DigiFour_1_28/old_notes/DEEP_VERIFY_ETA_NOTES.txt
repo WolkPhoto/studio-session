@@ -1,0 +1,1 @@
+Deep Verify shows files, bytes, measured throughput, elapsed time, progress and Cancel. ETA starts after 15 seconds of actual verification; shows Calculating until then. SHA-256 verification unchanged. Build requires macOS and Xcode command line tools.

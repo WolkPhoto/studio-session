@@ -1,0 +1,1 @@
+Folder Compare: cached rows and summary; no automatic comparison on linked folder changes, folder selection, mode changes or hidden toggle. Refresh explicitly launches scan. In-flight Deep Verify continues when tab is hidden. Existing results remain visible during a refresh.

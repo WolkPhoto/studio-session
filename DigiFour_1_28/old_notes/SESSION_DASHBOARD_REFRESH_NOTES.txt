@@ -1,0 +1,1 @@
+Version 07: Clear session-specific dashboard stats when session changes; prevent old asynchronous scan results from being applied to a new session; defer scans during active backup and automatically resume when backup finishes. Backup source stays pinned during active backup.

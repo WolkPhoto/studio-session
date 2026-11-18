@@ -68,25 +68,21 @@ import AppKit
     }
 
     private static func install(keepInDock: Bool) {
-        let fm = FileManager.default
+        // v1.46.7: copy first, swap after; the old copy only goes to the Trash once the new
+        // one is in place (DigiInstallCore). Before, a failed copy left Applications empty.
+        var dockNote = ""
         do {
-            if fm.fileExists(atPath: destination.path) {
-                try fm.trashItem(at: destination, resultingItemURL: nil)
+            if case .installedOldKept(let path) = try DigiInstallCore.replace(destination, with: runningURL) {
+                dockNote = " The previous version couldn't go to the Trash; it is at " + path + "."
             }
-            let ditto = Process()
-            ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            ditto.arguments = [runningURL.path, destination.path]
-            try ditto.run()
-            ditto.waitUntilExit()
-            guard ditto.terminationStatus == 0, fm.fileExists(atPath: destination.path) else {
-                simpleAlert("Install did not finish", "\(DigiBrand.name) could not be copied to Applications. Nothing else was changed.")
-                return
-            }
+        } catch let failure as DigiInstallCore.Failure {
+            let tail = failure.unchanged ? " Applications was not changed." : ""
+            simpleAlert("Install did not finish", failure.message + tail)
+            return
         } catch {
             simpleAlert("Install did not finish", error.localizedDescription)
             return
         }
-        var dockNote = ""
         if keepInDock && !isInDock(destination.path) && !addToDock(destination.path) {
             dockNote = " It could not be added to the Dock; drag it there from Applications."
         }

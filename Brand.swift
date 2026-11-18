@@ -73,14 +73,14 @@ enum DigiBrand {
     ]
     static let toolBlurbs: [String] = [
         "Your session at a glance, and what to do next.",
-        "Copy the session to your drives. Only new and changed files are copied.",
+        "Copy a folder to your drives. Only new and changed files are copied.",
         "Make a list of starred and color-tagged images.",
         "Make sure every selected image was exported.",
         "Make folders from a list, a spreadsheet or a number sequence.",
         "Write up the day: what was shot, backed up and delivered.",
         "Lay out images on printable contact sheet pages.",
         "Compare the session with your backups, file by file.",
-        "Watch a folder and add metadata to new images. Beta."
+        "Add your IPTC info to every raw as a sidecar .xmp. Capture One loads it."
     ]
 
 #if BRAND_GRIP
@@ -89,10 +89,10 @@ enum DigiBrand {
     static let nav = DigiNavStyle.sidebar
     static let toolNames = ["Home", "Backups", "Selects Report", "Export Check", "Folder Maker", "Job Report", "Contact Sheets", "Folder Checker", "Metadata"]
     static let fixedTheme = DigiTheme(scheme: .dark,
-        background: Color(digiHex: 0x0E0F10), surface: Color(digiHex: 0x17191B), raised: Color(digiHex: 0x1E2124),
-        line: Color(digiHex: 0x2A2D31), text: Color(digiHex: 0xECEAE4), subtext: Color(digiHex: 0x9A9EA4),
-        accent: Color(digiHex: 0xF2A93B), onAccent: Color(digiHex: 0x0E0F10),
-        good: Color(digiHex: 0x5BD08A), warn: Color(digiHex: 0xF5D061), bad: Color(digiHex: 0xFF6B5E),
+        background: Color(digiHex: 0x28292D), surface: Color(digiHex: 0x37383D), raised: Color(digiHex: 0x434448),
+        line: Color(digiHex: 0x4A4B50), text: Color(digiHex: 0xF2F2F4), subtext: Color(digiHex: 0xA3A4AA),
+        accent: Color(digiHex: 0x7E9AFF), onAccent: Color(digiHex: 0x14162A),
+        good: Color(digiHex: 0x6BD98A), warn: Color(digiHex: 0xF3CF5A), bad: Color(digiHex: 0xFF6B5E),
         design: .default, width: .expanded, radius: 12)
 #elseif BRAND_WRAP
     static let name = "Wrap"
@@ -175,13 +175,9 @@ enum DigiBrand {
     static let defaultToolOrder: [Int] = [0, 4, 1, 7, 6, 3, 2, 5, 8]
 #endif
 
-    /// v1.25: tools switched off in this app for now. Studio Session hides
-    /// Metadata until it's out of beta; its code is untouched.
-#if BRAND_GRIP
-    static let retiredTools: Set<Int> = [8]
-#else
+    /// v1.25: tools switched off in this app for now. v1.42: Studio Session's
+    /// Metadata tab is back (sidecar .xmp writer), so nothing is retired.
     static let retiredTools: Set<Int> = []
-#endif
 
     /// v1.12: the person's own order (drag to rearrange), else the default.
     static var toolOrder: [Int] { DigiToolOrder.current().filter { !retiredTools.contains($0) } }

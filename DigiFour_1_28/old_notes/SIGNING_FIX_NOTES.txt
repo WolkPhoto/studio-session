@@ -1,0 +1,1 @@
+Corrected sed backreference in signing identity detection; failed certificate signing now falls back to ad-hoc signing. No Swift source changes. macOS build not tested.

@@ -1,0 +1,7 @@
+Processing Completeness visual refresh
+- Dashboard source and layout left untouched.
+- 'Export Folder' is now displayed as 'Output Folder'.
+- Capture and Output auto-selection, custom overrides, and scan logic preserved.
+- Folder selectors now appear as dark rounded cards.
+- Processing results show larger metrics, progress bar, and grouped missing files.
+- This source package requires compilation on macOS.

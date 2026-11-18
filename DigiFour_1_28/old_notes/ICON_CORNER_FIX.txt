@@ -1,0 +1,1 @@
+Transparent corners applied to DigiSuiteIcon.png and all representations in DigiSuite.icns. build.command already embeds the .icns file.

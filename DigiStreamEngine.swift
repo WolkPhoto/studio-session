@@ -64,8 +64,59 @@ enum DigiStreamEngine {
     // running (Capture One or a tether still writing it). This is not fatal:
     // the file is skipped, the rest of the backup finishes, and the skipped
     // files are reported so the next run catches them.
+    /// v1.46: removal safety guard. Thrown after planning, before anything on the drive
+    /// changes, when many tracked files left the source (or the source is empty).
+    struct RemovalHold: Error {
+        let removed: Int
+        let tracked: Int
+        let sourceEmpty: Bool
+    }
+
+    /// v1.46: push what was written out to the drive itself before saying "Up to date",
+    /// so a cable pulled right after doesn't undo the last copies (seen in test C1:
+    /// 12 files had to be copied again). sync() flushes the Mac's own buffers;
+    /// F_FULLFSYNC asks the drive to empty its write cache. Best effort: if the drive
+    /// is gone the calls just fail. Not measured yet.
+    /// v1.46.7: returns why the flush failed, or nil when it worked (second audit, Nov 11,
+    /// F02). Before, every failure was ignored and the drive still said "Up to date".
+    /// A drive that doesn't support F_FULLFSYNC falls back to fsync; a drive that doesn't
+    /// support fsync on a folder either (some network shares) isn't counted as a failure.
+    @discardableResult
+    static func flushToDrive(_ root: URL, file: URL? = nil) -> String? {
+        Darwin.sync()
+        var paths: [String] = [root.path]
+        if let file { paths.append(file.path) }
+        for path in paths {
+            let descriptor: Int32 = Darwin.open(path, O_RDONLY)
+            guard descriptor >= 0 else {
+                return "couldn't open " + URL(fileURLWithPath: path).lastPathComponent + ": " + String(cString: strerror(errno))
+            }
+            defer { Darwin.close(descriptor) }
+            if fcntl(descriptor, F_FULLFSYNC) == 0 { continue }
+            if fsync(descriptor) == 0 { continue }
+            let code: Int32 = errno
+            if code == EINVAL || code == ENOTSUP || code == ENOTTY { continue }
+            return String(cString: strerror(code))
+        }
+        return nil
+    }
+
+    static func flushFailure(_ reason: String) -> NSError {
+        failure("The last copies couldn't be confirmed on the drive (" + reason
+                + "). Check that the drive is connected, then run Back Up again.")
+    }
+
     struct SourceChanged: Error {
         let relative: String
+    }
+
+    /// v1.46.7: the source's size moved WHILE a large file was being copied (Capture One
+    /// still writing its session database, a tethered raw still arriving). Before, copyLarge
+    /// threw a plain error here and the whole drive's backup failed (Nov 11 audit). Now it is
+    /// a busy file like any other: skipped, and the next run copies it. `written` is how many
+    /// bytes were already counted as in flight, so the caller can take them back off.
+    struct SourceMovedDuringCopy: Error {
+        let written: Int64
     }
 
     /// v1.37: a source file that can't be backed up as it is (no read permission, or a Finder
@@ -109,6 +160,19 @@ enum DigiStreamEngine {
     }
 
     /// Puts back the flags unlockIfLocked returned (no-op for nil).
+    /// v1.46.7: FAT (MS-DOS) drives reset a file's date to "now" when the finished temp file
+    /// is renamed to its real name. The backup then never matched its original, so every run
+    /// copied every file again (found Nov 11 on a FAT disk image by RUN_DRIVE_FORMAT_TESTS).
+    /// Called after a copy is moved into place and before it is locked again: if the date
+    /// moved by more than FAT's 2 s rounding, it is set again. Other drives keep the date,
+    /// so this is one extra stat there. If setting it fails, the next run copies the file again.
+    static func keepDate(_ url: URL, _ modified: Date) {
+        let fm = FileManager.default
+        guard let current = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+              abs(current.timeIntervalSince(modified)) > 2 else { return }
+        try? fm.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+    }
+
     static func relock(_ url: URL, _ flags: UInt32?) {
         #if canImport(Darwin)
         guard let flags else { return }
@@ -117,6 +181,17 @@ enum DigiStreamEngine {
     }
 
     /// Removes one of the engine's own temp files, clearing any lock it inherited first.
+    /// v1.39: when a file's inode last changed (rename, date set, flags), in seconds since 1970.
+    static func statusChangeTime(_ url: URL) -> Double? {
+        #if canImport(Darwin)
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return nil }
+        return Double(info.st_ctimespec.tv_sec) + Double(info.st_ctimespec.tv_nsec) / 1_000_000_000
+        #else
+        return nil
+        #endif
+    }
+
     static func removeTemp(_ url: URL) {
         #if canImport(Darwin)
         _ = chflags(url.path, 0)
@@ -274,7 +349,11 @@ enum DigiStreamEngine {
                           control: BackupControl, written: ByteCounter, verify: Bool = false,
                           readBack: Bool = true, uncached: Bool = true) throws -> UInt64? {
         let input = open(source.path, O_RDONLY)
-        guard input >= 0 else { throw posixFailure("Could not open", source.path) }
+        guard input >= 0 else {
+            // v1.46.7: gone between the check and the open: skip it, don't fail the drive.
+            if sourceIsGone(source) { throw SourceMovedDuringCopy(written: 0) }
+            throw posixFailure("Could not open", source.path)
+        }
         defer { close(input) }
         let output = open(target.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
         guard output >= 0 else { throw posixFailure("Could not create", target.path) }
@@ -318,7 +397,8 @@ enum DigiStreamEngine {
             written.add(Int64(count))
         }
         guard total == expectedSize else {
-            throw failure("Source size changed while copying: " + source.path)
+            // v1.46.7: skip-and-continue (see SourceMovedDuringCopy), never a failed drive.
+            throw SourceMovedDuringCopy(written: total)
         }
         outputOpen = false
         if close(output) != 0 { throw posixFailure("Could not finish writing", target.path) }
@@ -339,7 +419,10 @@ enum DigiStreamEngine {
         #if canImport(Darwin)
         let flags = copyfile_flags_t(COPYFILE_ACL | COPYFILE_STAT | COPYFILE_XATTR | COPYFILE_DATA | COPYFILE_EXCL)
         if copyfile(source.path, target.path, nil, flags) != 0 {
-            throw posixFailure("Could not copy", source.path)
+            let failed = posixFailure("Could not copy", source.path)
+            // v1.46.7: gone between the check and the copy: skip it, don't fail the drive.
+            if sourceIsGone(source) { throw SourceMovedDuringCopy(written: 0) }
+            throw failed
         }
         #else
         try FileManager().copyItem(at: source, to: target)
@@ -400,8 +483,29 @@ enum DigiStreamEngine {
         return abs(drift) > 0.001
     }
 
+    /// v1.46.7: true when the source path no longer names anything (deleted, moved to the
+    /// Trash by Capture One, or its folder renamed) after the scan saw it.
+    static func sourceIsGone(_ url: URL) -> Bool {
+        #if canImport(Darwin)
+        var info = stat()
+        if lstat(url.path, &info) == 0 { return false }
+        let code: Int32 = errno
+        return code == ENOENT || code == ENOTDIR
+        #else
+        return !FileManager.default.fileExists(atPath: url.path)
+        #endif
+    }
+
     static func checkSourceUnchanged(_ entry: BackupEntry) throws {
-        let attributes = try FileManager.default.attributesOfItem(atPath: entry.source.path)
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: entry.source.path)
+        } catch {
+            // v1.46.7: a file removed after the scan is a busy file, skipped like any other.
+            // Before, this threw a plain Cocoa error and failed the whole drive (Nov 11 audit #1).
+            if sourceIsGone(entry.source) { throw SourceChanged(relative: entry.relative) }
+            throw error
+        }
         let isFile = attributes[.type] as? FileAttributeType == .typeRegular
         let currentSize = (attributes[.size] as? NSNumber)?.int64Value ?? -1
         let modified = attributes[.modificationDate] as? Date ?? Date.distantPast
@@ -472,6 +576,7 @@ enum DigiStreamEngine {
                      verify: Bool = false,
                      readBack: Bool = true,
                      gate: DigiCaptureGate? = nil,
+                     allowLargeRemoval: Bool = false,
                      availableSpace: @escaping @Sendable (URL) -> Int64? = { DigiFastBackupEngine.availableBytes($0) },
                      report: @escaping @Sendable (SyncProgress) async -> Void) async -> SyncProgress {
         let fm = FileManager.default
@@ -498,12 +603,24 @@ enum DigiStreamEngine {
         // v1.25: checksums of files verified this run, for the report.
         var verified: [(String, UInt64)] = []
         var removedThisRun: [String] = []
+        /// v1.46.7: files copied this run with no checksum (Checking Off).
+        var uncheckedThisRun: [String] = []
         var reportRoot: URL?
         var reportDevice: NSNumber?
         var reportKeys: Set<String> = []
         var skippedThisRun: [String] = []   // v1.29: files still being written
         var problemsThisRun: [(String, String)] = []   // v1.37: files that couldn't be backed up, with why
         var uncachedWrites = true           // v1.36: false on exFAT/FAT destinations
+        // v1.39: copies an earlier run didn't finish checking (Stop, yanked drive, crash).
+        var pendingURL: URL?
+        var markerURL: URL?
+        var journal: DigiBackupReport.PendingJournal?
+        var carried: [String: UInt64] = [:]        // known checksum, not read back yet
+        var adopt: [String] = []                    // landed in an unfinished run, checksum unknown
+        var earlierRecords: [String: UInt64] = [:]  // checksums of earlier copies, for the list
+        var earlierRecorded = 0
+        var readBackOK: Set<String> = []
+        var adoptLeft = 0
         let inFlight = ByteCounter()
         var committedBytes: Int64 = 0
         var lastUpdate = Date.distantPast
@@ -514,6 +631,8 @@ enum DigiStreamEngine {
         var copying = false
         // Version 18.3: time spent paused is left out of average speed and ETA.
         var pausedSeconds: Double = 0
+        // v1.48: work done over the last ~10 s, for the time estimate.
+        var recentWork: [(at: Date, done: Int64)] = []
 
         func publish(force: Bool = false) async {
             let now = Date()
@@ -528,12 +647,34 @@ enum DigiStreamEngine {
             // Copy speed stays the copy speed; the read-back pass doesn't change it.
             if !copyRateFrozen { state.bytesPerSecond = Double(copiedNow) / transferElapsed }
             // v1.27: time left covers the read-back pass too (copy + read = the work).
-            let workTotal: Int64 = postVerify ? state.totalBytes * 2 : state.totalBytes
+            let workTotal: Int64 = postVerify ? state.totalBytes * 2 + state.extraReadBytes : state.totalBytes
             let workDone: Int64 = copiedNow + checkedNow
             let workRate: Double = Double(workDone) / transferElapsed
-            if workRate > 0 {
+            // v1.48: a better time estimate.
+            // 1. Say "Estimating…" (eta = nil) until the run has shown its pace:
+            //    5 s of copying, and 10% of the data or 25% of the files done
+            //    (or 30 s, whichever comes first). A run often starts with
+            //    thousands of tiny Capture One cache files that move at ~1 MB/s,
+            //    which made a 30-second backup read "43 min left".
+            // 2. Then use the faster of the whole-run speed and the last 10 s.
+            //    After a stretch of small files, the recent speed shows what the
+            //    big RAW files really move at; during a later stretch of small
+            //    files, the whole-run average keeps the estimate from jumping.
+            recentWork.append((now, workDone))
+            recentWork.removeAll { now.timeIntervalSince($0.at) > 10 }
+            var recentRate: Double = 0
+            if let first = recentWork.first, now.timeIntervalSince(first.at) >= 3 {
+                recentRate = Double(workDone - first.done) / now.timeIntervalSince(first.at)
+            }
+            let fileWorkTotal: Int = postVerify ? state.totalFiles * 2 : state.totalFiles
+            let fileWorkDone: Int = state.completedFiles + (postVerify ? state.verifiedFiles : 0)
+            let dataShare: Double = workTotal > 0 ? Double(workDone) / Double(workTotal) : 0
+            let fileShare: Double = fileWorkTotal > 0 ? Double(fileWorkDone) / Double(fileWorkTotal) : 0
+            let warmedUp: Bool = activeSeconds >= 5 && (dataShare >= 0.10 || fileShare >= 0.25 || activeSeconds >= 30)
+            let rate: Double = max(workRate, recentRate)
+            if warmedUp && rate > 0 {
                 let remaining: Int64 = max(Int64(0), workTotal - workDone)
-                state.eta = Double(remaining) / workRate
+                state.eta = Double(remaining) / rate
             } else {
                 state.eta = nil
             }
@@ -639,6 +780,91 @@ enum DigiStreamEngine {
                 }
             }
 
+            // v1.46: removal safety guard. Renamed files aren't really leaving, so they
+            // don't count. Nothing on the drive has changed yet when this throws.
+            if archiveRemoved && !allowLargeRemoval {
+                let renamedFrom: Set<String> = Set(renames.map(\.from))
+                let leaving: Int = plan.removed.filter { !renamedFrom.contains($0) }.count
+                let tracked: Int = plan.manifest.files.count
+                if DigiFastBackupEngine.removalNeedsOK(removed: leaving, tracked: tracked, sourceFiles: inventory.files.count) {
+                    throw RemovalHold(removed: leaving, tracked: tracked, sourceEmpty: inventory.files.isEmpty)
+                }
+            }
+
+            // v1.39: finish what an earlier run left unchecked. Two records:
+            // - the pending list: copies whose original checksum is known but that were
+            //   never read back (written line by line while copying);
+            // - the run marker: a checksummed run that never finished. On APFS and HFS+,
+            //   files it placed have a status-change time after it started, which catches
+            //   the last moment of copies whose pending line didn't reach the drive.
+            // Files being copied or renamed in this run start over, so earlier records
+            // for them don't count.
+            let reportsFolder = root.appendingPathComponent(DigiFastBackupEngine.reportsName, isDirectory: true)
+            let pendingFile = reportsFolder.appendingPathComponent(DigiBackupReport.pendingFileName)
+            let markerFile = reportsFolder.appendingPathComponent(DigiBackupReport.runMarkerName)
+            var sourceFiles: [String: DigiBackupSourceFile] = [:]
+            for file in inventory.files { sourceFiles[file.relative] = file }
+            let sourceFilesForRead = sourceFiles
+            var settled: Set<String> = Set(changes.map(\.relative))
+            for match in renames {
+                settled.insert(match.to.relative)
+                settled.insert(match.from)
+            }
+            let priorPending: [String: String] = DigiBackupReport.readChecksums(pendingFile)
+            for (relative, hex) in priorPending where sourceFiles[relative] != nil && !settled.contains(relative) {
+                guard let value = UInt64(hex, radix: 16) else { continue }
+                carried[relative] = value
+            }
+            let priorMarker: Date? = verify ? DigiBackupReport.readRunMarker(markerFile) : nil
+            if let began = priorMarker, destinationFS == "apfs" || destinationFS == "hfs" {
+                let since: Double = began.timeIntervalSince1970 - 2
+                for file in inventory.files where !settled.contains(file.relative) && carried[file.relative] == nil {
+                    if let changed = statusChangeTime(root.appendingPathComponent(file.relative)), changed >= since {
+                        adopt.append(file.relative)
+                    }
+                }
+            }
+            adoptLeft = adopt.count
+            for (relative, hash) in carried { earlierRecords[relative] = hash }
+            if verify || !priorPending.isEmpty {
+                try ensureDirectory(DigiFastBackupEngine.reportsName, under: root, device: expectedDevice)
+                pendingURL = pendingFile
+                // Drop records this run supersedes, then append this run's copies as they land.
+                try DigiBackupReport.writePending(carried, to: pendingFile)
+                if verify { journal = DigiBackupReport.PendingJournal(url: pendingFile) }
+            }
+            if verify {
+                markerURL = markerFile
+                // Keep the earliest unfinished start, so nothing it placed is missed.
+                let markerTime: Date = min(priorMarker ?? started, started)
+                try DigiBackupReport.writeRunMarker(markerFile, started: markerTime)
+            }
+            if postVerify {
+                var extra: Int64 = 0
+                for relative in carried.keys { extra += sourceFiles[relative]?.size ?? 0 }
+                for relative in adopt { extra += sourceFiles[relative]?.size ?? 0 }
+                state.extraReadBytes = extra
+            } else if verify && !adopt.isEmpty {
+                // Quick: record the originals' checksums for files an interrupted run placed.
+                state.status = "Checksumming files left by an interrupted backup…"
+                await publish(force: true)
+                for relative in adopt {
+                    try await control.checkpoint()
+                    guard let file = sourceFiles[relative] else { continue }
+                    let entry = BackupEntry(relative: relative, source: file.source,
+                                            destination: destination.appendingPathComponent(relative),
+                                            size: file.size, modified: file.modified)
+                    let hashControl = control
+                    let original = entry.source
+                    let hash: UInt64 = try await runBlocking { try DigiChecksum.hashFile(original, uncached: false, control: hashControl) }
+                    do { try checkSourceUnchanged(entry) } catch is SourceChanged { continue }
+                    earlierRecords[relative] = hash
+                    earlierRecorded += 1
+                }
+                adopt = []
+                adoptLeft = 0
+            }
+
             // Refuse to start if the planned copies cannot fit.
             var neededBytes: Int64 = 0
             var largestReplacement: Int64 = 0
@@ -673,6 +899,7 @@ enum DigiStreamEngine {
                 }
                 let renameFlags: UInt32? = try unlockIfLocked(old)
                 try fm.moveItem(at: old, to: match.to.destination)
+                keepDate(match.to.destination, match.to.modified)
                 relock(match.to.destination, renameFlags)
                 verified.append((match.to.relative, match.checksum))
                 removedThisRun.append(match.from)
@@ -689,6 +916,7 @@ enum DigiStreamEngine {
             let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + "-" + String(UUID().uuidString.prefix(8))
             let archivePrefix = DigiFastBackupEngine.archiveName + "/" + stamp
             var current = plan.manifest
+            current.sourceName = source.lastPathComponent   // v1.40: for the wrong-folder check
             let keys = Set(inventory.files.map(\.relative))
             reportKeys = keys
             current.files = current.files.filter { !filter.includes($0.key) || keys.contains($0.key) }
@@ -743,16 +971,20 @@ enum DigiStreamEngine {
                 } else {
                     try fm.moveItem(at: temporary, to: entry.destination)
                 }
+                keepDate(entry.destination, entry.modified)
                 relock(entry.destination, tempFlags)
                 state.finalizeSeconds += Date().timeIntervalSince(finalizeStarted)
                 temporaries.remove(temporary)
                 current.files[entry.relative] = "copied-size-date"
                 if let checksum = staged.checksum {
+                    journal?.append(entry.relative, checksum)   // v1.39: on record before the run ends
                     verified.append((entry.relative, checksum))
                     copiedChecks.append((entry.relative, checksum))
                     state.checksummedFiles += 1
                     // Copies checked as they were written (overlap path) count as verified.
                     if staged.needsReadBack || (readBack && !postVerify) { state.verifiedFiles += 1 }
+                } else {
+                    uncheckedThisRun.append(entry.relative)
                 }
                 state.completedFiles += 1
                 committedBytes += entry.size
@@ -792,6 +1024,7 @@ enum DigiStreamEngine {
             copyStarted = Date()
             liveStart = copyStarted; liveBytes = 0
             sampleStart = copyStarted; sampleBytes = 0
+            state.samplesStartedAt = copyStarted
             copying = !changes.isEmpty
 
             if copying {
@@ -828,37 +1061,46 @@ enum DigiStreamEngine {
                                 throw failure("A directory or symbolic link blocks the destination: " + entry.relative)
                             }
                             let copyBegan = Date()
-                            let checksum: UInt64? = try await runBlocking { () throws -> UInt64? in
-                                try waitIfPaused(laneControl)
-                                func copyOnce() throws -> UInt64? {
-                                    if lane == .large {
-                                        // With read-back on, large files are checked in their own step (below).
-                                        return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
-                                                             control: laneControl, written: counter, verify: verify,
-                                                             readBack: false, uncached: laneUncached)
-                                    }
-                                    // v1.27: Full verify reads small files back in the pass after copying too.
-                                    let value = try copySmall(source: entry.source, target: temporary, verify: verify,
-                                                              readBack: false, control: laneControl)
-                                    counter.add(entry.size)
-                                    return value
-                                }
-                                // v1.25: a bad read-back gets one fresh copy before it counts as a failure.
-                                var attempt = 0
-                                while true {
-                                    do {
-                                        if let laneGate {
-                                            return try laneGate.withPolicy { try copyOnce() }
+                            let checksum: UInt64?
+                            do {
+                                checksum = try await runBlocking { () throws -> UInt64? in
+                                    try waitIfPaused(laneControl)
+                                    func copyOnce() throws -> UInt64? {
+                                        if lane == .large {
+                                            // With read-back on, large files are checked in their own step (below).
+                                            return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
+                                                                 control: laneControl, written: counter, verify: verify,
+                                                                 readBack: false, uncached: laneUncached)
                                         }
-                                        return try copyOnce()
-                                    } catch is ChecksumMismatch where attempt == 0 {
-                                        attempt += 1
-                                        removeTemp(temporary)
-                                        if lane == .large { counter.add(-entry.size) }
-                                    } catch is ChecksumMismatch {
-                                        throw ChecksumMismatch(relative: entry.relative)
+                                        // v1.27: Full verify reads small files back in the pass after copying too.
+                                        let value = try copySmall(source: entry.source, target: temporary, verify: verify,
+                                                                  readBack: false, control: laneControl)
+                                        counter.add(entry.size)
+                                        return value
+                                    }
+                                    // v1.25: a bad read-back gets one fresh copy before it counts as a failure.
+                                    var attempt = 0
+                                    while true {
+                                        do {
+                                            if let laneGate {
+                                                return try laneGate.withPolicy { try copyOnce() }
+                                            }
+                                            return try copyOnce()
+                                        } catch is ChecksumMismatch where attempt == 0 {
+                                            attempt += 1
+                                            removeTemp(temporary)
+                                            if lane == .large { counter.add(-entry.size) }
+                                        } catch is ChecksumMismatch {
+                                            throw ChecksumMismatch(relative: entry.relative)
+                                        }
                                     }
                                 }
+                            } catch let moved as SourceMovedDuringCopy {
+                                // v1.46.7: still being written. Take its bytes back off the
+                                // progress, drop the partial temp, skip it like any busy file.
+                                counter.add(-moved.written)
+                                removeTemp(temporary)
+                                return .skipped(entry, lane)
                             }
                             let seconds = Date().timeIntervalSince(copyBegan)
                             var staged = Staged(entry: entry, temporary: temporary, lane: lane, seconds: seconds, checksum: checksum)
@@ -984,7 +1226,9 @@ enum DigiStreamEngine {
             // v1.27: Full verify. Everything is on the drive; now read every new copy
             // back and compare with the original's checksum. A copy that doesn't match
             // is copied again from the original (checked as it's written).
-            func repair(_ entry: BackupEntry, expected: UInt64) async throws {
+            /// `expected` nil (v1.39, earlier copies): the fresh copy only has to match the
+            /// original as it is now, checked as it's written. Returns that checksum.
+            func repair(_ entry: BackupEntry, expected: UInt64?) async throws -> UInt64 {
                 try checkSourceUnchanged(entry)
                 let temporary = entry.destination.deletingLastPathComponent()
                     .appendingPathComponent(".shootwrap-" + UUID().uuidString + ".tmp")
@@ -992,15 +1236,24 @@ enum DigiStreamEngine {
                 let repairControl = abort
                 let scratch = ByteCounter()
                 let repairUncached = uncachedWrites
-                let fresh: UInt64? = try await runBlocking { () throws -> UInt64? in
-                    if entry.size >= largeFileThreshold {
-                        return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
-                                             control: repairControl, written: scratch, verify: true, readBack: true,
-                                             uncached: repairUncached)
+                let fresh: UInt64?
+                do {
+                    fresh = try await runBlocking { () throws -> UInt64? in
+                        if entry.size >= largeFileThreshold {
+                            return try copyLarge(source: entry.source, target: temporary, expectedSize: entry.size,
+                                                 control: repairControl, written: scratch, verify: true, readBack: true,
+                                                 uncached: repairUncached)
+                        }
+                        return try copySmall(source: entry.source, target: temporary, verify: true, readBack: true, control: repairControl)
                     }
-                    return try copySmall(source: entry.source, target: temporary, verify: true, readBack: true, control: repairControl)
+                } catch is SourceMovedDuringCopy {
+                    // v1.46.7: the original is being written right now; the caller skips it.
+                    removeTemp(temporary)
+                    temporaries.remove(temporary)
+                    throw SourceChanged(relative: entry.relative)
                 }
-                guard fresh == expected else { throw ChecksumMismatch(relative: entry.relative) }
+                guard let fresh else { throw ChecksumMismatch(relative: entry.relative) }
+                if let expected, fresh != expected { throw ChecksumMismatch(relative: entry.relative) }
                 try checkSourceUnchanged(entry)
                 try checkDirectory(entry.destination.deletingLastPathComponent(), device: expectedDevice)
                 let repairFlags: UInt32? = try unlockIfLocked(temporary)
@@ -1008,12 +1261,35 @@ enum DigiStreamEngine {
                 try fm.setAttributes([.modificationDate: entry.modified], ofItemAtPath: temporary.path)
                 _ = try fm.replaceItemAt(entry.destination, withItemAt: temporary,
                                          backupItemName: nil, options: .usingNewMetadataOnly)
+                keepDate(entry.destination, entry.modified)
                 relock(entry.destination, repairFlags)
                 temporaries.remove(temporary)
                 state.repairedFiles += 1
+                return fresh
             }
             if !changes.isEmpty { state.copyPhaseSeconds = Date().timeIntervalSince(copyStarted) }
-            if postVerify && !copiedChecks.isEmpty {
+            // v1.46: copies are on the drive itself before the read-back pass starts.
+            if !changes.isEmpty || !renames.isEmpty, let problem = flushToDrive(root) {
+                throw flushFailure(problem)
+            }
+            // v1.39: earlier copies first (carried: checksum known; adopted: hash the
+            // original first), then this run's copies.
+            struct ReadItem {
+                let relative: String
+                let expected: UInt64?
+                let earlier: Bool
+            }
+            var readItems: [ReadItem] = []
+            if postVerify {
+                for relative in carried.keys.sorted() {
+                    readItems.append(ReadItem(relative: relative, expected: carried[relative], earlier: true))
+                }
+                for relative in adopt { readItems.append(ReadItem(relative: relative, expected: nil, earlier: true)) }
+                for (relative, checksum) in copiedChecks {
+                    readItems.append(ReadItem(relative: relative, expected: checksum, earlier: false))
+                }
+            }
+            if !readItems.isEmpty {
                 await publish(force: true)
                 copyRateFrozen = true
                 verifying = true
@@ -1022,19 +1298,48 @@ enum DigiStreamEngine {
                 let phaseStart = Date()
                 liveStart = phaseStart; liveBytes = 0
                 sampleStart = phaseStart; sampleBytes = 0
+                // v1.39: show the read-back pass right away (also lets Stop land here).
+                state.status = "Verifying copies…"
+                await publish(force: true)
                 var byRelative: [String: BackupEntry] = [:]
                 for entry in changes { byRelative[entry.relative] = entry }
-                let total: Int = copiedChecks.count
-                for (index, item) in copiedChecks.enumerated() {
+                func earlierEntry(_ relative: String) -> BackupEntry? {
+                    guard let file = sourceFilesForRead[relative] else { return nil }
+                    return BackupEntry(relative: relative, source: file.source,
+                                       destination: destination.appendingPathComponent(relative),
+                                       size: file.size, modified: file.modified)
+                }
+                let total: Int = readItems.count
+                for (index, item) in readItems.enumerated() {
                     try await pauseIfNeeded()
-                    let relative: String = item.0
-                    let expected: UInt64 = item.1
+                    let relative: String = item.relative
                     let target = root.appendingPathComponent(relative)
-                    state.status = "Verifying \(index + 1) of \(total): " + relative
+                    let entry: BackupEntry? = item.earlier ? earlierEntry(relative) : byRelative[relative]
+                    var label: String = "Verifying \(index + 1) of \(total): " + relative
+                    if item.earlier { label += " (left from an earlier backup)" }
+                    state.status = label
                     await publish()
                     let readControl = abort
                     let readGate = gate
                     let counter = checkedBytes
+                    var wanted: UInt64? = item.expected
+                    if wanted == nil {
+                        // Adopted: the original's checksum now; it must not change meanwhile.
+                        guard let entry else { continue }
+                        let original = entry.source
+                        let hash: UInt64 = try await runBlocking { () throws -> UInt64 in
+                            if let readGate { return try readGate.withPolicy { try DigiChecksum.hashFile(original, uncached: false, control: readControl) } }
+                            return try DigiChecksum.hashFile(original, uncached: false, control: readControl)
+                        }
+                        do { try checkSourceUnchanged(entry) }
+                        catch is SourceChanged {
+                            state.skippedFiles += 1
+                            skippedThisRun.append(relative)
+                            continue
+                        }
+                        wanted = hash
+                    }
+                    guard let expected = wanted else { continue }
                     var matched: Bool = try await runBlocking { () throws -> Bool in
                         func readOnce() throws -> Bool {
                             let copied = try DigiChecksum.hashFile(target, uncached: true, control: readControl, counted: counter)
@@ -1043,9 +1348,12 @@ enum DigiStreamEngine {
                         if let readGate { return try readGate.withPolicy { try readOnce() } }
                         return try readOnce()
                     }
-                    if !matched, let entry = byRelative[relative] {
+                    var recorded: UInt64 = expected
+                    if !matched, let entry {
                         do {
-                            try await repair(entry, expected: expected)
+                            // Earlier copies: the original may have been checksummed long ago;
+                            // a fresh copy only has to match the original as it is now.
+                            recorded = try await repair(entry, expected: item.earlier ? nil : expected)
                             matched = true
                         } catch is SourceChanged {
                             // v1.29: the original is being written right now. Leave this
@@ -1056,7 +1364,14 @@ enum DigiStreamEngine {
                         }
                     }
                     guard matched else { throw ChecksumMismatch(relative: relative) }
-                    state.verifiedFiles += 1
+                    readBackOK.insert(relative)
+                    if item.earlier {
+                        earlierRecords[relative] = recorded
+                        state.earlierVerified += 1
+                        if item.expected == nil { adoptLeft -= 1 }
+                    } else {
+                        state.verifiedFiles += 1
+                    }
                 }
                 verifying = false
                 state.verifyPhaseSeconds = Date().timeIntervalSince(phaseStart)
@@ -1087,11 +1402,25 @@ enum DigiStreamEngine {
             }
             try await control.checkpoint()
             try checkDirectory(root, device: expectedDevice)
-            try JSONEncoder().encode(current).write(to: root.appendingPathComponent(DigiFastBackupEngine.manifestName), options: .atomic)
+            let manifestURL: URL = root.appendingPathComponent(DigiFastBackupEngine.manifestName)
+            try JSONEncoder().encode(current).write(to: manifestURL, options: .atomic)
+            // v1.46: flush to the drive before saying "Up to date".
+            state.status = "Saving to the drive…"
+            await publish(force: true)
+            if let problem = flushToDrive(root, file: manifestURL) { throw flushFailure(problem) }
             state.finalizeSeconds += Date().timeIntervalSince(finishStarted)
             state.status = DigiFastBackupEngine.completeStatus
         } catch is CancellationError {
             state.status = "Stopped safely. Completed files retained."
+        } catch let hold as RemovalHold {
+            state.heldRemovals = hold.removed
+            state.heldOf = hold.tracked
+            let count: String = hold.removed.formatted()
+            if hold.sourceEmpty {
+                state.status = DigiFastBackupEngine.removalHoldPrefix + "The source folder is empty, so all " + count + " backed-up files would move to the archive."
+            } else {
+                state.status = DigiFastBackupEngine.removalHoldPrefix + count + " of " + hold.tracked.formatted() + " backed-up files are no longer in the source and would move to the archive."
+            }
         } catch {
             state.errorCount += 1
             state.status = "Error: " + error.localizedDescription
@@ -1100,9 +1429,22 @@ enum DigiStreamEngine {
         // The task group has drained, so no copy is still writing these.
         for temporary in temporaries { removeTemp(temporary) }
 
+        // v1.39: what still needs reading back after this run. With Full verify: earlier
+        // copies and this run's copies that weren't read back (Stop, error). Quick and Off
+        // never read back, so only earlier records stay. If the drive is gone these writes
+        // fail, and the list appended while copying stays on the drive for the next run.
+        journal?.close()
+        var remaining: [String: UInt64] = carried
+        if postVerify {
+            for (relative, checksum) in copiedChecks { remaining[relative] = checksum }
+            for relative in readBackOK { remaining[relative] = nil }
+        }
+        state.pendingReadBack = pendingURL == nil ? 0 : remaining.count
+        var listSaved = false
         // v1.25: checksum list and report on the drive, even after a stop or error,
         // so every file that was verified is on record.
-        if verify, let root = reportRoot, let device = reportDevice {
+        // v1.46: a held drive keeps its checksum list and reports exactly as they were.
+        if verify, state.heldRemovals == 0, let root = reportRoot, let device = reportDevice {
             let input = DigiBackupReport.Input(
                 source: source, destination: root, device: device, started: started, finished: Date(),
                 status: state.status, verified: verified, removed: removedThisRun,
@@ -1110,11 +1452,43 @@ enum DigiStreamEngine {
                 copiedBytes: committedBytes, readBack: readBack,
                 readBackDone: postVerify ? state.verifiedFiles : 0, renamedPaths: renamedPaths,
                 archived: archivedCount, repaired: state.repairedFiles, skipped: skippedThisRun,
-                problems: problemsThisRun)
+                problems: problemsThisRun,
+                earlier: earlierRecords.map { ($0.key, $0.value) },
+                earlierVerified: state.earlierVerified, earlierRecorded: earlierRecorded,
+                pendingLeft: state.pendingReadBack)
             do {
                 state.reportPath = try DigiBackupReport.write(input)
+                listSaved = true
             } catch {
                 state.engineNote = "Couldn't write the checksum report: " + error.localizedDescription
+            }
+        }
+        // v1.46.7: Checking Off writes no list, but an existing one must not keep the old
+        // checksums of files this run replaced or removed (Nov 11 audit #6).
+        if !verify, state.heldRemovals == 0, let root = reportRoot {
+            do {
+                try DigiBackupReport.refreshList(root, known: verified,
+                                                 forget: uncheckedThisRun + removedThisRun)
+            } catch {
+                let note = "Couldn't update the checksum list: " + error.localizedDescription
+                state.engineNote = state.engineNote.isEmpty ? note : state.engineNote + " · " + note
+            }
+        }
+        if let pendingURL {
+            // Earlier copies leave the pending list only once their checksums are in the list.
+            var keep: [String: UInt64] = remaining
+            if verify && !listSaved {
+                for (relative, hash) in carried { keep[relative] = hash }
+            }
+            do {
+                try DigiBackupReport.writePending(keep, to: pendingURL)
+                // Everything unchecked is in the pending list now; the marker is only still
+                // needed for files placed by an earlier run that this run never got to.
+                if let markerURL, listSaved, adoptLeft == 0 {
+                    try? fm.removeItem(at: markerURL)
+                }
+            } catch {
+                // Drive gone: the list appended while copying is the record.
             }
         }
 
