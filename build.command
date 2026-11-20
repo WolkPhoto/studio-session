@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="1.48"
+VERSION="1.48.1"
 BUILD="61"
 # v1.25: where Check for Updates looks (github.com/<owner>/<repo>/releases).
 UPDATE_REPO="${UPDATE_REPO:-$(cat UPDATE_REPO.txt 2>/dev/null | tr -d '[:space:]' || true)}"

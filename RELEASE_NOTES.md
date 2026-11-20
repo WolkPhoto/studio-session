@@ -1,4 +1,10 @@
-Studio Session 1.48
+Studio Session 1.48.1
+
+**1.48.1**
+- Fixed: after switching sessions, Backups kept the previous session's drive folders (TO still showed Drive_2/TEST_SHOOT and its last backup). Drives now follow the session. A drive with a folder for the new session switches to it. A drive without one comes off the list and offers Create Folder. Each session remembers its own drives, so switching back brings them back. A note above the drives says what changed.
+- Fixed: "Matching folder found" could still name the old session after a switch.
+- Automatic backups now get the same "Folder names don't match" check as Back Up Now. If a drive's folder holds a different session's backup, the automatic backup is skipped (nothing copied) and Backups says why.
+- Backups warns right away when a drive in the list isn't connected: each time you open Backups and whenever Studio Session comes to the front, not only when a backup runs.
 
 **1.48**
 - New look: lighter midtone grays and a blue highlight color in place of orange. The app icon matches.

@@ -498,7 +498,7 @@ struct ShootWrapProject: Codable {
                 if self.syncBusy {
                     self.scheduleStatus = "Previous backup still running; next cycle will retry"
                 } else {
-                    self.startSync(scheduled: true)
+                    self.startScheduledSync()
                 }
             }
         }
@@ -1141,6 +1141,8 @@ struct ShootWrapProject: Codable {
     @Published var discoveredBackupMessage = "Choose Discover Drives to find backup destinations."
     @Published var discoveredBackupScanning = false
     @Published var discoveredBackupDrives: [DiscoveredBackupDrive] = []
+    private var discoveryGeneration = 0
+    private var discoveryName = ""
 
     /// v1.26: backup folders are named after what's being backed up (the backup
     /// source), which can differ from the session open on Home.
@@ -1152,7 +1154,12 @@ struct ShootWrapProject: Codable {
             return
         }
         let sessionName = session.lastPathComponent
-        guard !sessionName.isEmpty, !discoveredBackupScanning else { return }
+        guard !sessionName.isEmpty else { return }
+        // v1.48.1: a newer search wins. It used to be skipped while one was running, so after a
+        // session switch the drives kept showing the old session's matches (SS-1).
+        discoveryGeneration += 1
+        let generation = discoveryGeneration
+        if discoveryName != sessionName { discoveredBackupDrives = []; discoveryName = sessionName }
         discoveredBackupScanning = true
         discoveredBackupMessage = "Looking for matching folders on mounted drives…"
         let sessionPath = session.resolvingSymlinksInPath().standardizedFileURL.path
@@ -1190,6 +1197,7 @@ struct ShootWrapProject: Codable {
                 results.append(DiscoveredBackupDrive(volume: volume, matchingFolder: match, suggestedFolder: direct))
             }
             DispatchQueue.main.async {
+                guard generation == self.discoveryGeneration else { return }
                 guard self.backupSourceForNaming?.resolvingSymlinksInPath().standardizedFileURL.path == sessionPath else {
                     self.discoveredBackupScanning = false
                     return
@@ -1298,10 +1306,116 @@ struct ShootWrapProject: Codable {
     /// v1.46: also used when a folder is dropped on the FROM card.
     func setSyncSource(_ url: URL) {
         guard !syncBusy else { return }
-        syncSource = url; syncProgress = []; syncPreviewReady = false
-        // v1.26: folder suggestions on connected drives follow the new source's name.
+        switchBackupSource(to: url)
+    }
+
+    // MARK: Drives follow the session (v1.48.1, SS-1)
+
+    nonisolated static let destinationsBySourceKey = "DigiSuite.destinationsBySource"
+    /// Shown above the drives after a switch: which drives moved to the new session's folder.
+    @Published var destinationNote: String? = nil
+    /// Set when an automatic backup was skipped because a drive's folder holds another session.
+    @Published var scheduleMismatch: String? = nil
+
+    /// The drive a destination is on ("Drive_2" for /Volumes/Drive_2/testestest).
+    nonisolated static func driveName(_ url: URL) -> String {
+        let parts = url.standardizedFileURL.pathComponents
+        if parts.count > 2, parts[1] == "Volumes" { return parts[2] }
+        return url.deletingLastPathComponent().lastPathComponent
+    }
+
+    /// Changes what's being backed up. Backup folders named after the old source move to the same
+    /// drive's folder for the new one. Each source remembers its own drives, so switching back
+    /// brings them back.
+    func switchBackupSource(to new: URL) {
+        guard !syncBusy else { return }
+        let old: URL? = syncSource
+        syncSource = new; syncProgress = []; syncPreviewReady = false
+        scheduleMismatch = nil
+        if let old, old.standardizedFileURL.path != new.standardizedFileURL.path {
+            retargetDestinations(from: old, to: new)
+        }
         discoverExternalBackupFolders()
         refreshSourceSummary()
+        refreshDriveStatus()
+    }
+
+    private func retargetDestinations(from old: URL, to new: URL) {
+        var memory: [String: [String]] = (UserDefaults.standard.dictionary(forKey: Self.destinationsBySourceKey) as? [String: [String]]) ?? [:]
+        // An empty list isn't remembered: it means no drives were set up yet, not "use no drives".
+        memory[old.standardizedFileURL.path] = backups.isEmpty ? nil : backups.map(\.path)
+        defer { UserDefaults.standard.set(memory, forKey: Self.destinationsBySourceKey) }
+        let newName: String = new.lastPathComponent
+        if let saved = memory[new.standardizedFileURL.path], !saved.isEmpty {
+            backups = saved.map { URL(fileURLWithPath: $0) }
+            destinationNote = "Back to the drives you used for " + newName + "."
+            return
+        }
+        let oldName: String = old.lastPathComponent
+        guard oldName != newName else { destinationNote = nil; return }
+        let fm = FileManager.default
+        var kept: [URL] = []
+        var moved: [String] = []
+        var dropped: [String] = []
+        for destination in backups {
+            guard destination.lastPathComponent == oldName else {
+                // Picked by hand under another name: left alone ("Folder names don't match" still guards it).
+                if !kept.contains(destination) { kept.append(destination) }
+                continue
+            }
+            let sibling: URL = destination.deletingLastPathComponent().appendingPathComponent(newName, isDirectory: true)
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: sibling.path, isDirectory: &isDir), isDir.boolValue {
+                if let filter = backupFilters[destination.path], backupFilters[sibling.path] == nil { backupFilters[sibling.path] = filter }
+                if !kept.contains(sibling) { kept.append(sibling) }
+                moved.append(Self.driveName(destination))
+            } else {
+                dropped.append(Self.driveName(destination))
+            }
+        }
+        backups = kept
+        var parts: [String] = []
+        if !moved.isEmpty { parts.append(moved.joined(separator: ", ") + ": using its " + newName + " folder.") }
+        if !dropped.isEmpty {
+            let list: String = dropped.joined(separator: ", ")
+            parts.append(list + (dropped.count == 1 ? " has" : " have") + " no " + newName + " folder yet, so " + (dropped.count == 1 ? "it was" : "they were")
+                + " taken off the list. Use Create Folder under the drive when it's connected.")
+        }
+        destinationNote = parts.isEmpty ? nil : "Drives now follow " + newName + ". " + parts.joined(separator: " ")
+    }
+
+    /// Checks drive connections and looks for matching folders again. Run when Backups is
+    /// opened and when the app comes to the front, so an unplugged drive shows before a backup.
+    func checkDrivesNow() {
+        guard !syncBusy, !driveCheckRunning else { return }
+        refreshDriveStatus()
+        discoverExternalBackupFolders()
+    }
+
+    /// v1.48.1: automatic backups now get the same "Folder names don't match" check as Back Up
+    /// Now. A mismatch skips the run (nothing is copied) and says why; the person decides at the Mac.
+    func startScheduledSync() {
+        guard let source = syncSource, !backups.isEmpty, !driveCheckRunning else { startSync(scheduled: true); return }
+        let destinations: [URL] = backups
+        Task.detached(priority: .utility) {
+            var found: [String] = []
+            for destination in destinations {
+                if let other = DigiFastBackupEngine.otherSourceName(source: source, destination: destination) {
+                    let held: String = other.isEmpty ? "a different folder" : other
+                    found.append(destination.lastPathComponent + " on " + WrapModel.driveName(destination) + " holds a backup of " + held)
+                }
+            }
+            let lines = found
+            await MainActor.run {
+                guard !self.syncBusy, self.syncSource == source, self.backups == destinations else { return }
+                guard !lines.isEmpty else { self.scheduleMismatch = nil; self.startSync(scheduled: true); return }
+                let text: String = "Automatic backup skipped: folder names don't match. " + lines.joined(separator: "; ")
+                    + ". You're backing up " + source.lastPathComponent + ". Use Back Up Now to decide."
+                self.scheduleMismatch = text
+                self.scheduleStatus = "Skipped: folder names don't match"
+                self.scheduleLastRun = Date()
+            }
+        }
     }
     nonisolated static func syncInventory(_ root: URL, filter: BackupFilter = BackupFilter()) throws -> [(String, URL, Int64)] {
         let fm = FileManager.default
@@ -2702,9 +2816,7 @@ struct ShootWrapView: View {
             pendingBackupSource = session
         } else if model.syncSource != session {
             pendingBackupSource = nil
-            model.syncSource = session
-            model.syncProgress = []
-            model.syncPreviewReady = false
+            model.switchBackupSource(to: session)
         }
     }
     private var tabOrder: [Int] {
@@ -2957,9 +3069,7 @@ struct ShootWrapView: View {
                         if !busy { model.resumeDeferredDashboardScan() }
                         if !busy, let pending = pendingBackupSource {
                             pendingBackupSource = nil
-                            model.syncSource = pending
-                            model.syncProgress = []
-                            model.syncPreviewReady = false
+                            model.switchBackupSource(to: pending)
                         }
                     }
                     .opacity(model.lastTab == 7 ? 1 : 0)
@@ -4618,6 +4728,7 @@ struct ShootWrapView: View {
                 Text("Checking").font(.subheadline).foregroundStyle(.secondary)
                 checkingPicker
             }
+            driveWarningBanner
             backupFlowRow
             backupActionRow
             backupPreviewSection
@@ -4721,9 +4832,53 @@ struct ShootWrapView: View {
             model.refreshDriveStatus()
             model.autoSaveWorkspace()
         }
+        // v1.48.1: tabs stay loaded, so onAppear ran once. Check drives each time Backups is
+        // opened and whenever the app comes to the front.
+        .onChange(of: model.lastTab) { _, tab in if tab == 1 { model.checkDrivesNow() } }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.checkDrivesNow()
+        }
         .onChange(of: model.backupFilters) { _, _ in model.autoSaveWorkspace() }
         .onChange(of: model.archiveChanged) { _, _ in model.autoSaveWorkspace() }
         .onChange(of: model.archiveRemoved) { _, _ in model.autoSaveWorkspace() }
+    }
+    /// v1.48.1: unplugged drives, a skipped automatic backup, and where drives went after a session switch.
+    @ViewBuilder private var driveWarningBanner: some View {
+        let missing: [URL] = model.syncBusy ? [] : model.backups.filter { model.driveStatus[$0.path]?.isConnected == false }
+        if !missing.isEmpty || model.scheduleMismatch != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                if !missing.isEmpty {
+                    let names: String = missing.map { WrapModel.driveName($0) }.joined(separator: ", ")
+                    Label(missing.count == 1 ? names + " isn't connected" : "\(missing.count) backup drives aren't connected: " + names,
+                          systemImage: "externaldrive.badge.xmark")
+                        .font(.subheadline.weight(.semibold))
+                    Text(missing.count == 1
+                         ? "Plug it in to back up to it. Not using it for this session? Remove it with the minus button on its card (nothing on the drive is deleted)."
+                         : "Plug them in to back up to them. Not using one for this session? Remove it with the minus button on its card (nothing on the drive is deleted).")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let mismatch = model.scheduleMismatch {
+                    Label(mismatch, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .foregroundStyle(Color.orange)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        }
+        if let note = model.destinationNote {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "arrow.triangle.branch").foregroundStyle(DigiBrand.accent)
+                Text(note).font(.caption).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button("OK") { model.destinationNote = nil }.buttonStyle(.borderless)
+            }
+            .padding(10)
+            .background(DigiBrand.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        }
     }
     var selects: some View {
         VStack(alignment: .leading, spacing: 15) {
